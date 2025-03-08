@@ -175,7 +175,7 @@ def getRemainingSearches(driver):
         remainingMobile = int((targetMobile - progressMobile) / searchPoints)
     return remainingDesktop, remainingMobile
 
-@retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1))
+# @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1))
 def main():
     print("启动！")
     argv = sys.argv
@@ -183,31 +183,36 @@ def main():
     if len(argv) == 2:
         s = argv[1]
     edge_driver = init_browser(s)
-    time.sleep(random.randint(2, 4))
-    daily_set(edge_driver)
-    (
-        remainingSearches,
-        remainingSearchesM,
-    )=getRemainingSearches(edge_driver)
-    goSearch(edge_driver)
-    keyword_list = getDouYinTrends()
-    desk_time = 0
-    if remainingSearches != 0:
-        desk_time = remainingSearches/3+10
-    for i in tqdm(range(desk_time), desc="bing searches", unit="search"):
-        bing_search(edge_driver, random.choice(keyword_list))
-    edge_driver.close()
-    edge_driver = init_mobile_edge_appium(s)
-    goSearch(edge_driver)
-    keyword_list = getBaiduTrends()
-    mobile_time = 0
-    if remainingSearchesM != 0:
-        mobile_time = remainingSearchesM/3+5
-    for i in tqdm(range(int(mobile_time)), desc="bing searches", unit="search"):
-        keyword = random.choice(keyword_list)
-        keyword_list.remove(keyword)
-        bing_search(edge_driver, keyword)
+    try:
         time.sleep(random.randint(2, 4))
+        daily_set(edge_driver)
+        (
+            remainingSearches,
+            remainingSearchesM,
+        )=getRemainingSearches(edge_driver)
+        goSearch(edge_driver)
+        keyword_list = getDouYinTrends()
+        desk_time = 0
+        if remainingSearches != 0:
+            desk_time = remainingSearches/3+10
+        for i in tqdm(range(int(desk_time)), desc="bing searches", unit="search"):
+            bing_search(edge_driver, random.choice(keyword_list))
+    finally:
+        edge_driver.close()
+    edge_driver = init_mobile_edge_appium(s)
+    try:
+        goSearch(edge_driver)
+        keyword_list = getBaiduTrends()
+        mobile_time = 0
+        if remainingSearchesM != 0:
+            mobile_time = remainingSearchesM/3+5
+        for i in tqdm(range(int(mobile_time)), desc="bing searches", unit="search"):
+            keyword = random.choice(keyword_list)
+            keyword_list.remove(keyword)
+            bing_search(edge_driver, keyword)
+            time.sleep(random.randint(2, 4))
+    finally:
+        edge_driver.close()
 
 
 if __name__ == "__main__":
