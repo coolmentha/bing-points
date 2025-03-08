@@ -196,7 +196,9 @@ def main():
         if remainingSearches != 0:
             desk_time = remainingSearches/3+10
         for i in tqdm(range(int(desk_time)), desc="bing searches", unit="search"):
-            bing_search(edge_driver, random.choice(keyword_list))
+            keyword = random.choice(keyword_list)
+            keyword_list.remove(keyword)
+            bing_search(edge_driver, keyword)
     finally:
         edge_driver.close()
     edge_driver = init_mobile_edge_appium(s)
