@@ -84,3 +84,28 @@ def test_ensure_keywords_fallback(monkeypatch):
 def test_ensure_keywords_pick_first():
     words = ["a", "b"]
     assert main._ensure_keywords([], words, ["c"]) == words
+
+
+def test_parse_accounts_basic():
+    raw = "user1:pwd1;user2:pwd2\nuser3:pwd3"
+    result = main._parse_accounts(raw)
+    assert result == [("user1", "pwd1"), ("user2", "pwd2"), ("user3", "pwd3")]
+
+
+def test_parse_accounts_skip_invalid():
+    raw = "badentry; user: ; :pwd; valid:ok"
+    result = main._parse_accounts(raw)
+    assert result == [("valid", "ok")]
+
+
+def test_load_accounts_raise(monkeypatch):
+    monkeypatch.setattr(main, "ACCOUNTS_PATH", Path("/tmp/not_exists_accounts.txt"))
+    with pytest.raises(RuntimeError):
+        main._load_accounts()
+
+
+def test_load_accounts_success(monkeypatch):
+    cfg = monkeypatch.tmpdir.mkdir("acc").join("accounts.txt")
+    cfg.write("u1:p1\n#comment\nu2:p2")
+    monkeypatch.setattr(main, "ACCOUNTS_PATH", Path(str(cfg)))
+    assert main._load_accounts() == [("u1", "p1"), ("u2", "p2")]

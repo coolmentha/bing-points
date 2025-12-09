@@ -30,6 +30,7 @@ from tqdm import tqdm
 DEFAULT_DRIVER_PATH = Path(__file__).with_name("msedgedriver.exe")
 DEFAULT_KEYWORDS = ["微软奖励", "必应搜索", "信息流热点", "今天新闻", "最新科技", "体育资讯"]
 REQUEST_TIMEOUT = 8
+ACCOUNTS_PATH = Path(__file__).with_name("accounts.txt")
 EDGE_RELEASE_URLS = [
     "https://msedgewebdriverstorage.blob.core.windows.net/edgewebdriver/LATEST_RELEASE",
     "https://msedgedriver.azureedge.net/LATEST_RELEASE",
@@ -41,6 +42,36 @@ EDGE_DOWNLOAD_BASES = [
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
+
+
+def _parse_accounts(raw: str) -> list[tuple[str, str]]:
+    """解析账号串，支持逗号、分号或换行分隔的 user:password 形式，忽略空行与注释。"""
+    accounts: list[tuple[str, str]] = []
+    if not raw:
+        return accounts
+    for part in re.split(r"[;,\n]+", raw):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        user, pwd = part.split(":", 1)
+        user = user.strip()
+        if not user or not pwd:
+            continue
+        accounts.append((user, pwd))
+    return accounts
+
+
+def _load_accounts(path: Path | None = None) -> list[tuple[str, str]]:
+    """从配置文件读取账号列表，文件中每行 user:password，支持逗号/分号/换行分隔。"""
+    cfg = path or ACCOUNTS_PATH
+    if not cfg.exists():
+        raise RuntimeError(f"未找到账号配置文件：{cfg}，请创建并写入 user:password，每行或以逗号/分号分隔")
+    raw = cfg.read_text(encoding="utf-8")
+    raw = "\n".join(line for line in raw.splitlines() if not line.strip().startswith("#"))
+    accounts = _parse_accounts(raw)
+    if not accounts:
+        raise RuntimeError(f"账号配置为空，请在 {cfg} 中填写 user:password")
+    return accounts
 
 
 def _resolve_driver_path() -> str | None:
@@ -101,6 +132,8 @@ def _download_driver(target_path: Path):
 
 
 def _download_zip(url: str, target_path: Path):
+    # 重新检测平台标识，便于选择正确的驱动文件名
+    platform_token = _detect_driver_platform()
     tmp_file = None
     try:
         resp = requests.get(url, timeout=REQUEST_TIMEOUT * 3, stream=True, headers=HTTP_HEADERS)
@@ -219,6 +252,168 @@ def _apply_stealth(driver):
         )
     except ValueError as exc:
         print(f"Stealth 注入失败（{exc}），继续使用默认配置")
+
+
+def _extract_dashboard_email(dashboard: dict) -> str | None:
+    user_status = dashboard.get("userStatus", {}) if dashboard else {}
+    email = user_status.get("userEmail") or user_status.get("email")
+    return email.lower() if isinstance(email, str) else None
+
+
+def _detect_logged_in_email(driver) -> str | None:
+    """进入个人中心尝试读取当前登录邮箱，失败则返回 None。"""
+    try:
+        driver.get("https://account.microsoft.com/")
+        wait = WebDriverWait(driver, 15)
+        email_pattern = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
+        # 优先从页面配置 JSON 读取 signInName
+        try:
+            feedback_root = wait.until(EC.presence_of_element_located((By.ID, "feedback-root")))
+            config_raw = feedback_root.get_attribute("data-area-config") or ""
+            if config_raw:
+                try:
+                    import json
+
+                    config = json.loads(config_raw)
+                    sign_in_name = config.get("signInName")
+                    if sign_in_name and email_pattern.search(sign_in_name):
+                        return sign_in_name.lower()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        selectors = [
+            # (By.CSS_SELECTOR, "#mectrl_currentAccount_secondary"),
+            # (By.CSS_SELECTOR, "#mectrl_currentAccount_primary"),
+            # (By.CSS_SELECTOR, ".mectrlaccounttext"),
+            # (By.CSS_SELECTOR, "div[data-bi-name='profileAccount'] span"),
+            # 个人中心新版 UI：FUI 文本组件
+            (By.CSS_SELECTOR, "span.fui-Text"),
+        ]
+        for by, sel in selectors:
+            try:
+                elem = wait.until(EC.presence_of_element_located((by, sel)))
+                text = (elem.text or "").strip()
+                if not text or "@" not in text:
+                    continue
+                match = email_pattern.search(text)
+                if match:
+                    return match.group(0).lower()
+            except Exception:
+                continue
+        # 回退：遍历页面文本查找邮箱模式
+        try:
+            elements = driver.find_elements(By.CSS_SELECTOR, "span, div, p, a")
+            for el in elements:
+                txt = (el.text or "").strip()
+                if not txt or "@" not in txt:
+                    continue
+                match = email_pattern.search(txt)
+                if match:
+                    return match.group(0).lower()
+        except Exception:
+            pass
+    except Exception:
+        return None
+    return None
+
+
+def _sign_out(driver):
+    try:
+        driver.get("https://login.live.com/logout.srf")
+        time.sleep(2)
+    except Exception:
+        pass
+
+
+def login(driver, username: str, password: str):
+    """执行 Microsoft 账号登录，如已登录其他账号则先注销。"""
+    print(f"登录账号：{username}")
+    driver.get("https://login.live.com/")
+    wait = WebDriverWait(driver, 20)
+    try:
+        # 登录页可能直接展示选择账号，如果已记住账号则需要点击“使用其他账号”
+        try:
+            use_other = wait.until(EC.presence_of_element_located((By.ID, "otherTile")))
+            use_other.click()
+        except Exception:
+            pass
+
+        # 新版 UI 使用 id=usernameEntry；旧版仍为 name=loginfmt
+        email_locators = [
+            (By.ID, "usernameEntry"),
+            (By.NAME, "loginfmt"),
+        ]
+        email_input = None
+        for by, locator in email_locators:
+            try:
+                email_input = wait.until(EC.presence_of_element_located((by, locator)))
+                break
+            except Exception:
+                continue
+        if email_input is None:
+            raise RuntimeError("未找到账号输入框，登录页面结构可能已变")
+        email_input.clear()
+        email_input.send_keys(username)
+        next_button_locators = [
+            (By.CSS_SELECTOR, "button[data-testid='primaryButton']"),
+            (By.ID, "idSIButton9"),
+        ]
+        next_btn = None
+        for by, locator in next_button_locators:
+            try:
+                next_btn = wait.until(EC.element_to_be_clickable((by, locator)))
+                break
+            except Exception:
+                continue
+        if next_btn is None:
+            raise RuntimeError("未找到下一步按钮，登录页面结构可能已变")
+        next_btn.click()
+
+        # 某些账号会出现“使用密码”卡片，需要先点击才能出现密码输入框
+        try:
+            pwd_tile = wait.until(
+                EC.element_to_be_clickable(
+                    (
+                        By.CSS_SELECTOR,
+                        'div[data-testid="tile"][aria-label="使用密码"], div[role="group"][aria-label="使用密码"]',
+                    )
+                )
+            )
+            pwd_tile.click()
+        except Exception:
+            pass
+
+        pwd_input = wait.until(EC.presence_of_element_located((By.NAME, "passwd")))
+        pwd_input.clear()
+        pwd_input.send_keys(password)
+        pwd_next_locators = [
+            (By.CSS_SELECTOR, "button[data-testid='primaryButton']"),
+            (By.ID, "idSIButton9"),
+        ]
+        sign_btn = None
+        for by, locator in pwd_next_locators:
+            try:
+                sign_btn = wait.until(EC.element_to_be_clickable((by, locator)))
+                break
+            except Exception:
+                continue
+        if sign_btn is None:
+            raise RuntimeError("未找到密码提交按钮，登录页面结构可能已变")
+        sign_btn.click()
+
+        try:
+            no_btn = wait.until(EC.element_to_be_clickable((By.ID, "idBtn_Back")))
+            no_btn.click()
+        except Exception:
+            pass
+
+        wait.until(lambda d: "login.live.com" not in d.current_url or "rewards" in d.current_url)
+        print("登录完成")
+    except Exception as exc:
+        print(f"登录失败：{exc}")
+        raise
 
 
 def init_browser(s):
@@ -549,57 +744,94 @@ def _ensure_keywords(*keyword_lists):
     return DEFAULT_KEYWORDS.copy()
 
 
+def _search_loop(driver, keyword_list, loops: int, tag: str, extra_sleep: bool = False):
+    if loops <= 0:
+        print(f"{tag} 已无剩余搜索")
+        return
+    for _ in tqdm(range(int(loops)), desc="bing searches", unit="search"):
+        keyword = random.choice(keyword_list)
+        if len(keyword_list) > 1:
+            keyword_list.remove(keyword)
+        bing_search(driver, keyword)
+        if extra_sleep:
+            time.sleep(random.randint(2, 4))
+        _maybe_take_break(tag)
+
+
+def _run_desktop_flow(username: str, password: str, headless_flag: str | None) -> int:
+    remaining_mobile = 0
+    driver = init_browser(headless_flag)
+    try:
+        # 若已有登录态则尝试个人中心读取邮箱
+        current_email = _detect_logged_in_email(driver)
+        if current_email:
+            if current_email == username.lower():
+                print("检测到已有登录态，直接复用")
+            else:
+                print(f"当前登录为 {current_email}，与目标 {username} 不一致，执行注销后重新登录")
+                _sign_out(driver)
+                login(driver, username, password)
+        else:
+            print("未能读取当前邮箱，默认注销后登录以确保账号匹配")
+            _sign_out(driver)
+            login(driver, username, password)
+        gohome(driver)
+        time.sleep(random.randint(2, 4))
+        daily_set(driver)
+        remaining_desktop, remaining_mobile = getRemainingSearches(driver)
+        goSearch(driver)
+        keyword_list = _ensure_keywords(
+            getDouYinTrends(),
+            getBaiduTrends(),
+            getZhihuTrends(),
+        )
+        desk_time = remaining_desktop / 3 + 10 if remaining_desktop else 0
+        _search_loop(driver, keyword_list, desk_time, "PC")
+    finally:
+        driver.quit()
+    return remaining_mobile
+
+
+def _run_mobile_flow(username: str, password: str, headless_flag: str | None, remaining_mobile: int):
+    driver = init_mobile_edge_appium(headless_flag)
+    try:
+        current_email = _detect_logged_in_email(driver)
+        if current_email:
+            if current_email == username.lower():
+                print("移动端检测到已有登录态，直接复用")
+            else:
+                print(f"移动端当前登录为 {current_email}，与目标 {username} 不一致，注销后登录")
+                _sign_out(driver)
+                login(driver, username, password)
+        else:
+            print("移动端未能读取邮箱，默认先注销再登录确保账号一致")
+            _sign_out(driver)
+            login(driver, username, password)
+        gohome(driver)
+        goSearch(driver)
+        keyword_list = _ensure_keywords(
+            getBaiduTrends(),
+            getZhihuTrends(),
+            getDouYinTrends(),
+        )
+        mobile_time = remaining_mobile / 3 + 5 if remaining_mobile else 0
+        _search_loop(driver, keyword_list, mobile_time, "Mobile", extra_sleep=True)
+    finally:
+        driver.quit()
+
+
 def main():
     print("启动！")
     argv = sys.argv
     s = None
     if len(argv) == 2:
         s = argv[1]
-    remainingSearches = 0
-    remainingSearchesM = 0
-    edge_driver = init_browser(s)
-    try:
-        time.sleep(random.randint(2, 4))
-        daily_set(edge_driver)
-        remainingSearches, remainingSearchesM = getRemainingSearches(edge_driver)
-        goSearch(edge_driver)
-        keyword_list = _ensure_keywords(
-            getDouYinTrends(),
-            getBaiduTrends(),
-            getZhihuTrends(),
-        )
-        desk_time = 0
-        if remainingSearches:
-            desk_time = remainingSearches / 3 + 10
-        for _ in tqdm(range(int(desk_time)), desc="bing searches", unit="search"):
-            keyword = random.choice(keyword_list)
-            if len(keyword_list) > 1:
-                keyword_list.remove(keyword)
-            bing_search(edge_driver, keyword)
-            _maybe_take_break("PC")
-    finally:
-        edge_driver.quit()
-
-    edge_driver = init_mobile_edge_appium(s)
-    try:
-        goSearch(edge_driver)
-        keyword_list = _ensure_keywords(
-            getBaiduTrends(),
-            getZhihuTrends(),
-            getDouYinTrends(),
-        )
-        mobile_time = 0
-        if remainingSearchesM:
-            mobile_time = remainingSearchesM / 3 + 5
-        for _ in tqdm(range(int(mobile_time)), desc="bing searches", unit="search"):
-            keyword = random.choice(keyword_list)
-            if len(keyword_list) > 1:
-                keyword_list.remove(keyword)
-            bing_search(edge_driver, keyword)
-            time.sleep(random.randint(2, 4))
-            _maybe_take_break("Mobile")
-    finally:
-        edge_driver.quit()
+    accounts = _load_accounts()
+    for index, (username, password) in enumerate(accounts, 1):
+        print(f"开始处理账号 {index}/{len(accounts)}：{username}")
+        remaining_mobile = _run_desktop_flow(username, password, s)
+        _run_mobile_flow(username, password, s, remaining_mobile)
+    print("所有账号处理完毕")
 
 
 if __name__ == "__main__":

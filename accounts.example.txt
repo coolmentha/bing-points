@@ -1,0 +1,6 @@
+# 示例账号配置文件（放在与 main.py 同目录）
+# 支持逗号、分号或换行分隔；空行和注释会被忽略
+user1@example.com:password1
+user2@example.com:password2;user3@example.com:password3
+# 换行写法
+user4@example.com:password4
