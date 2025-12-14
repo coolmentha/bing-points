@@ -30,6 +30,7 @@ from tqdm import tqdm
 DEFAULT_DRIVER_PATH = Path(__file__).with_name("msedgedriver.exe")
 DEFAULT_KEYWORDS = ["微软奖励", "必应搜索", "信息流热点", "今天新闻", "最新科技", "体育资讯"]
 REQUEST_TIMEOUT = 8
+TRENDS_CACHE_FAILURE_TTL = 600
 ACCOUNTS_PATH = Path(__file__).with_name("accounts.txt")
 EDGE_RELEASE_URLS = [
     "https://msedgewebdriverstorage.blob.core.windows.net/edgewebdriver/LATEST_RELEASE",
@@ -42,6 +43,8 @@ EDGE_DOWNLOAD_BASES = [
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
+
+_TRENDS_CACHE: dict[str, dict] = {}
 
 
 def _parse_accounts(raw: str) -> list[tuple[str, str]]:
@@ -254,12 +257,6 @@ def _apply_stealth(driver):
         print(f"Stealth 注入失败（{exc}），继续使用默认配置")
 
 
-def _extract_dashboard_email(dashboard: dict) -> str | None:
-    user_status = dashboard.get("userStatus", {}) if dashboard else {}
-    email = user_status.get("userEmail") or user_status.get("email")
-    return email.lower() if isinstance(email, str) else None
-
-
 def _detect_logged_in_email(driver) -> str | None:
     """进入个人中心尝试读取当前登录邮箱，失败则返回 None。"""
     try:
@@ -417,30 +414,18 @@ def login(driver, username: str, password: str):
 
 
 def init_browser(s):
-    options = EdgeOptions()
-    if s:
-        options.add_argument("--headless")
-    options.add_argument("--disable-notifications")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.use_chromium = True
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
-    driver_path = _resolve_driver_path()
-    if driver_path:
-        service = EdgeService(executable_path=driver_path)
-        driver = webdriver.Edge(service=service, options=options)
-    else:
-        driver = webdriver.Edge(options=options)
-    _apply_stealth(driver)
-    return driver
+    return _init_edge(headless_flag=s, mobile_emulation=None)
 
 
 def init_mobile_edge_appium(s):
-    mobile_emulation = {"deviceName": "iPhone X"}
+    return _init_edge(headless_flag=s, mobile_emulation={"deviceName": "iPhone X"})
+
+
+def _init_edge(headless_flag: str | None, mobile_emulation: dict | None):
     options = EdgeOptions()
-    options.add_experimental_option("mobileEmulation", mobile_emulation)
-    if s:
+    if mobile_emulation:
+        options.add_experimental_option("mobileEmulation", mobile_emulation)
+    if headless_flag:
         options.add_argument("--headless")
     options.add_argument("--disable-notifications")
     options.add_argument("--no-sandbox")
@@ -657,82 +642,126 @@ def goSearch(driver):
         raise
 
 
-def getBaiduTrends() -> list:
-    words = []
-    try:
-        r = requests.get("https://v2.xxapi.cn/api/baiduhot", timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"获取百度热榜失败：{e}")
-        return words
-    data = r.json().get("data", [])
-    for trend in data:
-        title = trend.get("title")
-        if title:
-            words.append(title)
+def _get_cached_trends(cache_key: str, fetcher) -> list:
+    now = time.time()
+    today = datetime.now().strftime("%Y-%m-%d")
+    cached = _TRENDS_CACHE.get(cache_key)
+
+    if cached:
+        if cached.get("date") == today and cached.get("ok") and isinstance(cached.get("words"), list):
+            return cached["words"].copy()
+        if (
+            not cached.get("ok")
+            and isinstance(cached.get("ts"), (int, float))
+            and now - cached["ts"] < TRENDS_CACHE_FAILURE_TTL
+        ):
+            return []
+
+    words = fetcher() or []
+    ok = bool(words)
+    _TRENDS_CACHE[cache_key] = {"date": today, "ts": now, "ok": ok, "words": words.copy()}
     return words
+
+
+def getBaiduTrends() -> list:
+    def _fetch():
+        words = []
+        try:
+            r = requests.get(
+                "https://v2.xxapi.cn/api/baiduhot",
+                timeout=REQUEST_TIMEOUT,
+                headers=HTTP_HEADERS,
+            )
+            r.raise_for_status()
+        except Exception as e:
+            print(f"获取百度热榜失败：{e}")
+            return words
+        data = r.json().get("data", [])
+        for trend in data:
+            title = trend.get("title")
+            if title:
+                words.append(title)
+        return words
+
+    return _get_cached_trends("baidu", _fetch)
 
 
 def getZhihuTrends():
-    words = []
-    try:
-        r = requests.get("https://api.cenguigui.cn/api/juhe/hotlist.php?type=zhihu", timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"获取知乎热榜失败：{e}")
+    def _fetch():
+        words = []
+        try:
+            r = requests.get(
+                "https://api.cenguigui.cn/api/juhe/hotlist.php?type=zhihu",
+                timeout=REQUEST_TIMEOUT,
+                headers=HTTP_HEADERS,
+            )
+            r.raise_for_status()
+        except Exception as e:
+            print(f"获取知乎热榜失败：{e}")
+            return words
+        data = r.json().get("data", [])
+        for trend in data:
+            title = trend.get("title")
+            if title:
+                words.append(title)
         return words
-    data = r.json().get("data", [])
-    for trend in data:
-        title = trend.get("title")
-        if title:
-            words.append(title)
-    return words
+
+    return _get_cached_trends("zhihu", _fetch)
 
 
 def getDouYinTrends():
-    words = []
-    try:
-        r = requests.get("https://api.cenguigui.cn/api/juhe/hotlist.php?type=weibo", timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"获取抖音/微博热榜失败：{e}")
+    def _fetch():
+        words = []
+        try:
+            r = requests.get(
+                "https://api.cenguigui.cn/api/juhe/hotlist.php?type=weibo",
+                timeout=REQUEST_TIMEOUT,
+                headers=HTTP_HEADERS,
+            )
+            r.raise_for_status()
+        except Exception as e:
+            print(f"获取抖音/微博热榜失败：{e}")
+            return words
+        data = r.json().get("data", [])
+        for trend in data:
+            title = trend.get("title")
+            if title:
+                words.append(title)
         return words
-    data = r.json().get("data", [])
-    for trend in data:
-        title = trend.get("title")
-        if title:
-            words.append(title)
-    return words
+
+    return _get_cached_trends("douyin", _fetch)
+
+
+def _infer_search_points(target_total: int) -> int:
+    if target_total in (33, 102):
+        return 3
+    if target_total == 55 or target_total >= 170:
+        return 5
+    return 1
 
 
 def getRemainingSearches(driver):
     dashboard = getDashboardData(driver)
     if not dashboard:
         return 0, 0
-    searchPoints = 1
     user_status = dashboard.get("userStatus", {})
     counters = user_status.get("counters", {})
     pcSearch = counters.get("pcSearch") or []
-
-    if not pcSearch:
-        return 0, 0
-
-    progressDesktop = sum(item.get("pointProgress", 0) for item in pcSearch)
-    targetDesktop = sum(item.get("pointProgressMax", 0) for item in pcSearch)
-
-    if targetDesktop in [33, 102]:
-        searchPoints = 3
-    elif targetDesktop == 55 or targetDesktop >= 170:
-        searchPoints = 5
-    remainingDesktop = max(0, int((targetDesktop - progressDesktop) / searchPoints))
+    remainingDesktop = 0
+    if pcSearch:
+        progressDesktop = sum(item.get("pointProgress", 0) for item in pcSearch)
+        targetDesktop = sum(item.get("pointProgressMax", 0) for item in pcSearch)
+        search_points = _infer_search_points(targetDesktop)
+        remainingDesktop = max(0, int((targetDesktop - progressDesktop) / search_points))
 
     remainingMobile = 0
     level_info = user_status.get("levelInfo", {})
     mobileSearch = counters.get("mobileSearch") or []
     if level_info.get("activeLevel") != "Level1" and mobileSearch:
-        progressMobile = mobileSearch[0].get("pointProgress", 0)
-        targetMobile = mobileSearch[0].get("pointProgressMax", 0)
-        remainingMobile = max(0, int((targetMobile - progressMobile) / searchPoints))
+        progressMobile = sum(item.get("pointProgress", 0) for item in mobileSearch)
+        targetMobile = sum(item.get("pointProgressMax", 0) for item in mobileSearch)
+        search_points = _infer_search_points(targetMobile)
+        remainingMobile = max(0, int((targetMobile - progressMobile) / search_points))
     return remainingDesktop, remainingMobile
 
 
@@ -744,14 +773,30 @@ def _ensure_keywords(*keyword_lists):
     return DEFAULT_KEYWORDS.copy()
 
 
-def _search_loop(driver, keyword_list, loops: int, tag: str, extra_sleep: bool = False):
-    if loops <= 0:
+def _keyword_cycle(words: list[str]):
+    if not words:
+        return
+    last = None
+    while True:
+        pool = words.copy()
+        random.shuffle(pool)
+        if last is not None and len(pool) > 1 and pool[0] == last:
+            pool[0], pool[1] = pool[1], pool[0]
+        for item in pool:
+            yield item
+            last = item
+
+
+def _search_loop(driver, keyword_list, searches: int, tag: str, extra_sleep: bool = False):
+    if searches <= 0:
         print(f"{tag} 已无剩余搜索")
         return
-    for _ in tqdm(range(int(loops)), desc="bing searches", unit="search"):
-        keyword = random.choice(keyword_list)
-        if len(keyword_list) > 1:
-            keyword_list.remove(keyword)
+    if not keyword_list:
+        print(f"{tag} 未获取到关键词，跳过搜索")
+        return
+    cycle = _keyword_cycle(keyword_list)
+    for _ in tqdm(range(int(searches)), desc=f"{tag} bing searches", unit="search"):
+        keyword = next(cycle)
         bing_search(driver, keyword)
         if extra_sleep:
             time.sleep(random.randint(2, 4))
@@ -779,21 +824,23 @@ def _run_desktop_flow(username: str, password: str, headless_flag: str | None) -
         time.sleep(random.randint(2, 4))
         daily_set(driver)
         remaining_desktop, remaining_mobile = getRemainingSearches(driver)
-        goSearch(driver)
-        keyword_list = _ensure_keywords(
-            getDouYinTrends(),
-            getBaiduTrends(),
-            getZhihuTrends(),
-        )
-        desk_time = remaining_desktop / 3 + 10 if remaining_desktop else 0
-        _search_loop(driver, keyword_list, desk_time, "PC")
+        if remaining_desktop > 0:
+            goSearch(driver)
+            keyword_list = _ensure_keywords(
+                getDouYinTrends(),
+                getBaiduTrends(),
+                getZhihuTrends(),
+            )
+            _search_loop(driver, keyword_list, remaining_desktop, "PC")
+        else:
+            print("PC 无剩余搜索次数，跳过 PC 搜索")
     finally:
         driver.quit()
     return remaining_mobile
 
 
 def _run_mobile_flow(username: str, password: str, headless_flag: str | None, remaining_mobile: int):
-    if remaining_mobile <= 0:
+    if not _should_run_mobile(remaining_mobile):
         print("移动端无剩余搜索次数，跳过移动端流程")
         return
     driver = init_mobile_edge_appium(headless_flag)
@@ -817,23 +864,34 @@ def _run_mobile_flow(username: str, password: str, headless_flag: str | None, re
             getZhihuTrends(),
             getDouYinTrends(),
         )
-        mobile_time = remaining_mobile / 3 + 5 if remaining_mobile else 0
-        _search_loop(driver, keyword_list, mobile_time, "Mobile", extra_sleep=True)
+        _search_loop(driver, keyword_list, remaining_mobile, "Mobile", extra_sleep=True)
     finally:
         driver.quit()
+
+
+def _should_run_mobile(remaining_mobile: int) -> bool:
+    return remaining_mobile > 0
+
+
+def _parse_headless_flag(argv: list[str]) -> str | None:
+    if len(argv) < 2:
+        return None
+    flag = (argv[1] or "").strip().lower()
+    if flag in ("headless", "--headless", "-h"):
+        return argv[1]
+    print(f"未识别参数：{argv[1]}，将以有界面模式运行（如需无头请传 headless）")
+    return None
 
 
 def main():
     print("启动！")
     argv = sys.argv
-    s = None
-    if len(argv) == 2:
-        s = argv[1]
+    s = _parse_headless_flag(argv)
     accounts = _load_accounts()
     for index, (username, password) in enumerate(accounts, 1):
         print(f"开始处理账号 {index}/{len(accounts)}：{username}")
         remaining_mobile = _run_desktop_flow(username, password, s)
-        if remaining_mobile > 0:
+        if _should_run_mobile(remaining_mobile):
             _run_mobile_flow(username, password, s, remaining_mobile)
         else:
             print("移动端无剩余搜索次数，跳过移动端搜索")
