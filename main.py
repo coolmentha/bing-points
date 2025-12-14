@@ -793,6 +793,9 @@ def _run_desktop_flow(username: str, password: str, headless_flag: str | None) -
 
 
 def _run_mobile_flow(username: str, password: str, headless_flag: str | None, remaining_mobile: int):
+    if remaining_mobile <= 0:
+        print("移动端无剩余搜索次数，跳过移动端流程")
+        return
     driver = init_mobile_edge_appium(headless_flag)
     try:
         current_email = _detect_logged_in_email(driver)
@@ -830,7 +833,10 @@ def main():
     for index, (username, password) in enumerate(accounts, 1):
         print(f"开始处理账号 {index}/{len(accounts)}：{username}")
         remaining_mobile = _run_desktop_flow(username, password, s)
-        _run_mobile_flow(username, password, s, remaining_mobile)
+        if remaining_mobile > 0:
+            _run_mobile_flow(username, password, s, remaining_mobile)
+        else:
+            print("移动端无剩余搜索次数，跳过移动端搜索")
     print("所有账号处理完毕")
 
 

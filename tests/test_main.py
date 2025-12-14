@@ -109,3 +109,45 @@ def test_load_accounts_success(monkeypatch):
     cfg.write("u1:p1\n#comment\nu2:p2")
     monkeypatch.setattr(main, "ACCOUNTS_PATH", Path(str(cfg)))
     assert main._load_accounts() == [("u1", "p1"), ("u2", "p2")]
+
+
+def test_run_mobile_flow_skip_when_no_remaining(monkeypatch):
+    called = {"init": 0}
+
+    def fake_init(_):
+        called["init"] += 1
+        raise AssertionError("不应初始化移动端浏览器")
+
+    monkeypatch.setattr(main, "init_mobile_edge_appium", fake_init)
+    main._run_mobile_flow("u@example.com", "pwd", None, remaining_mobile=0)
+    assert called["init"] == 0
+
+
+def test_run_mobile_flow_init_when_remaining(monkeypatch):
+    class FakeDriver:
+        def quit(self):
+            return None
+
+    called = {"init": 0, "search_loop": 0}
+
+    def fake_init(_):
+        called["init"] += 1
+        return FakeDriver()
+
+    monkeypatch.setattr(main, "init_mobile_edge_appium", fake_init)
+    monkeypatch.setattr(main, "_detect_logged_in_email", lambda _: "u@example.com")
+    monkeypatch.setattr(main, "gohome", lambda _: None)
+    monkeypatch.setattr(main, "goSearch", lambda _: None)
+    monkeypatch.setattr(main, "getBaiduTrends", lambda: [])
+    monkeypatch.setattr(main, "getZhihuTrends", lambda: [])
+    monkeypatch.setattr(main, "getDouYinTrends", lambda: [])
+    monkeypatch.setattr(main, "_ensure_keywords", lambda *args: ["k1"])
+
+    def fake_search_loop(driver, keyword_list, loops, tag, extra_sleep=False):
+        called["search_loop"] += 1
+        assert tag == "Mobile"
+
+    monkeypatch.setattr(main, "_search_loop", fake_search_loop)
+    main._run_mobile_flow("u@example.com", "pwd", None, remaining_mobile=3)
+    assert called["init"] == 1
+    assert called["search_loop"] == 1
