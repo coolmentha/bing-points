@@ -31,6 +31,8 @@ DEFAULT_DRIVER_PATH = Path(__file__).with_name("msedgedriver.exe")
 DEFAULT_KEYWORDS = ["微软奖励", "必应搜索", "信息流热点", "今天新闻", "最新科技", "体育资讯"]
 REQUEST_TIMEOUT = 8
 TRENDS_CACHE_FAILURE_TTL = 600
+NAVIGATION_TIMEOUT = 20
+DASHBOARD_WAIT_TIMEOUT = 15
 ACCOUNTS_PATH = Path(__file__).with_name("accounts.txt")
 EDGE_RELEASE_URLS = [
     "https://msedgewebdriverstorage.blob.core.windows.net/edgewebdriver/LATEST_RELEASE",
@@ -77,30 +79,77 @@ def _load_accounts(path: Path | None = None) -> list[tuple[str, str]]:
     return accounts
 
 
+def _extract_major_version(version: str | None) -> str | None:
+    if not version:
+        return None
+    match = re.search(r"(\d+)", version)
+    return match.group(1) if match else None
+
+
+def _get_driver_version(driver_path: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            [str(driver_path), "--version"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=REQUEST_TIMEOUT,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    output = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+    match = re.search(r"(\d+\.\d+\.\d+\.\d+)", output)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _is_driver_compatible(driver_path: Path, edge_major: str | None) -> bool:
+    if not edge_major:
+        return True
+    driver_version = _get_driver_version(driver_path)
+    driver_major = _extract_major_version(driver_version)
+    if not driver_major:
+        print(f"无法读取驱动版本，继续尝试使用：{driver_path}")
+        return True
+    if driver_major != edge_major:
+        print(f"驱动主版本({driver_major})与浏览器主版本({edge_major})不匹配：{driver_path}")
+        return False
+    return True
+
+
 def _resolve_driver_path() -> str | None:
+    edge_major = _extract_major_version(_get_edge_version())
     driver_env = os.getenv("EDGEWEBDRIVER")
     if driver_env:
         resolved_path = Path(driver_env).expanduser()
-        if resolved_path.exists():
+        if not resolved_path.exists():
+            raise FileNotFoundError(f"EDGEWEBDRIVER 指向的驱动不存在：{resolved_path}")
+        if _is_driver_compatible(resolved_path, edge_major):
             return str(resolved_path)
-        raise FileNotFoundError(f"EDGEWEBDRIVER 指向的驱动不存在：{resolved_path}")
+        print("EDGEWEBDRIVER 指向的驱动版本不匹配，已忽略该配置")
 
     resolved_path = DEFAULT_DRIVER_PATH
     if resolved_path.exists():
-        return str(resolved_path)
+        if _is_driver_compatible(resolved_path, edge_major):
+            return str(resolved_path)
+        print(f"本地驱动版本不匹配，尝试自动更新：{resolved_path}")
 
     try:
         _download_driver(resolved_path)
     except Exception as exc:
         print(f"自动下载 Edge 驱动失败：{exc}")
 
-    if resolved_path.exists():
+    if resolved_path.exists() and _is_driver_compatible(resolved_path, edge_major):
         return str(resolved_path)
 
     existing = _find_driver_on_path()
     if existing:
-        print(f"发现 PATH 中的驱动：{existing}")
-        return existing
+        existing_path = Path(existing)
+        if _is_driver_compatible(existing_path, edge_major):
+            print(f"发现 PATH 中的驱动：{existing}")
+            return existing
+        print(f"PATH 中驱动版本不匹配，已忽略：{existing}")
 
     print("未找到可用驱动，将交给 Selenium Manager 自动管理")
     return None
@@ -316,6 +365,101 @@ def _detect_logged_in_email(driver) -> str | None:
     return None
 
 
+def _detect_bing_logged_in_email(driver) -> str | None:
+    """在 Bing 首页尝试读取当前登录邮箱，失败则返回 None。"""
+    try:
+        _safe_get(driver, "https://www.bing.com/")
+        wait = WebDriverWait(driver, 10)
+        email_pattern = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
+
+        # 尝试打开右上角账号菜单
+        for by, sel in [
+            (By.ID, "mectrl_main_trigger"),
+            (By.ID, "id_l"),
+            (By.CSS_SELECTOR, "#mectrl_main_trigger"),
+        ]:
+            try:
+                elem = wait.until(EC.element_to_be_clickable((by, sel)))
+                elem.click()
+                break
+            except Exception:
+                continue
+
+        selectors = [
+            (By.CSS_SELECTOR, "#mectrl_currentAccount_secondary"),
+            (By.CSS_SELECTOR, "#mectrl_currentAccount_primary"),
+            (By.CSS_SELECTOR, ".mectrlaccounttext"),
+        ]
+        for by, sel in selectors:
+            try:
+                elem = wait.until(EC.presence_of_element_located((by, sel)))
+                text = (elem.text or "").strip()
+                match = email_pattern.search(text)
+                if match:
+                    return match.group(0).lower()
+            except Exception:
+                continue
+
+        # 回退：全页扫描邮箱
+        try:
+            elements = driver.find_elements(By.CSS_SELECTOR, "span, div, p, a")
+            for el in elements:
+                txt = (el.text or "").strip()
+                if not txt or "@" not in txt:
+                    continue
+                match = email_pattern.search(txt)
+                if match:
+                    return match.group(0).lower()
+        except Exception:
+            pass
+    except Exception:
+        return None
+    return None
+
+
+def _bing_sign_out(driver):
+    try:
+        _safe_get(driver, "https://www.bing.com/fd/auth/signout?return_url=https%3A%2F%2Fwww.bing.com%2F")
+        time.sleep(1)
+    except Exception:
+        pass
+
+
+def _bing_sign_in(driver):
+    # 使用交互式登录入口，让 Bing 侧与当前 MSA 登录态对齐
+    try:
+        _safe_get(
+            driver,
+            "https://www.bing.com/fd/auth/signin?action=interactive&provider=windows_live_id&return_url=https%3A%2F%2Fwww.bing.com%2F",
+        )
+        time.sleep(1)
+    except Exception:
+        pass
+
+
+def _ensure_bing_account(driver, username: str, tag: str = ""):
+    prefix = f"{tag} " if tag else ""
+    current = _detect_bing_logged_in_email(driver)
+    if current and current == username.lower():
+        print(f"{prefix}Bing 账号已对齐：{current}")
+        return
+    if current and current != username.lower():
+        print(f"{prefix}Bing 当前登录为 {current}，与目标 {username} 不一致，尝试重新对齐")
+    else:
+        print(f"{prefix}未能读取 Bing 当前邮箱，尝试重新对齐")
+
+    _bing_sign_out(driver)
+    _bing_sign_in(driver)
+    current2 = _detect_bing_logged_in_email(driver)
+    if current2 and current2 == username.lower():
+        print(f"{prefix}Bing 账号对齐完成：{current2}")
+        return
+    if current2:
+        print(f"{prefix}Bing 账号仍不一致：当前 {current2}，目标 {username}（可能被风控/需手动确认）")
+    else:
+        print(f"{prefix}Bing 账号对齐后仍无法读取邮箱（可能需要手动打开账号菜单确认）")
+
+
 def _sign_out(driver):
     try:
         driver.get("https://login.live.com/logout.srf")
@@ -401,16 +545,111 @@ def login(driver, username: str, password: str):
         sign_btn.click()
 
         try:
-            no_btn = wait.until(EC.element_to_be_clickable((By.ID, "idBtn_Back")))
-            no_btn.click()
+            # 新版 UI 的“否”常为 secondaryButton，旧版为 idBtn_Back
+            if not _try_click(driver, By.CSS_SELECTOR, "button[data-testid='secondaryButton']"):
+                no_btn = wait.until(EC.element_to_be_clickable((By.ID, "idBtn_Back")))
+                no_btn.click()
         except Exception:
             pass
 
-        wait.until(lambda d: "login.live.com" not in d.current_url or "rewards" in d.current_url)
+        _wait_login_complete(driver, timeout=60)
         print("登录完成")
     except Exception as exc:
         print(f"登录失败：{exc}")
         raise
+
+
+def _wait_document_ready(driver, timeout: int = NAVIGATION_TIMEOUT) -> bool:
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _safe_get(driver, url: str, timeout: int = NAVIGATION_TIMEOUT):
+    driver.get(url)
+    _wait_document_ready(driver, timeout=timeout)
+
+
+def _try_click(driver, by, locator) -> bool:
+    try:
+        elements = driver.find_elements(by, locator)
+    except Exception:
+        return False
+    for el in elements:
+        try:
+            el.click()
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _wait_login_complete(driver, timeout: int = 60):
+    """等待登录流程完成或识别阻塞页面，避免直接 TimeoutException 难以排查。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        url = (getattr(driver, "current_url", "") or "").lower()
+        if "rewards" in url or "login.live.com" not in url:
+            return
+
+        try:
+            err_elems = driver.find_elements(By.ID, "passwordError")
+            for el in err_elems:
+                txt = (el.text or "").strip()
+                if txt:
+                    raise RuntimeError(f"账号或密码可能错误：{txt}")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+        try:
+            src = getattr(driver, "page_source", "") or ""
+            blockers = [
+                ("帮助我们保护你的帐户", "账号触发安全验证（需要手动验证），无法自动完成登录"),
+                ("验证你的身份", "账号需要验证身份（可能为二次验证/短信/邮箱验证）"),
+                ("更多信息", "账号需要补充安全信息（More information required）"),
+                ("two-step verification", "账号开启了两步验证，需要手动处理"),
+                ("approve sign in request", "需要在手机/Authenticator 上确认本次登录"),
+                ("验证", "登录页面要求额外验证，建议改用有界面模式观察阻塞点"),
+            ]
+            src_lower = src.lower()
+            for needle, message in blockers:
+                if needle.lower() in src_lower:
+                    raise RuntimeError(message)
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+        _try_click(driver, By.CSS_SELECTOR, "button[data-testid='secondaryButton']")
+        _try_click(driver, By.ID, "idBtn_Back")
+        _try_click(driver, By.CSS_SELECTOR, "button[data-testid='primaryButton']")
+        time.sleep(1)
+
+    raise RuntimeError(f"登录后页面未跳转，当前 URL：{getattr(driver, 'current_url', '')}")
+
+
+def _ensure_logged_in(driver, username: str, password: str, tag: str = ""):
+    """确保当前 driver 登录为指定账号，tag 用于区分 PC/移动端日志。"""
+    prefix = f"{tag} " if tag else ""
+    current_email = _detect_logged_in_email(driver)
+    if current_email:
+        if current_email == username.lower():
+            print(f"{prefix}检测到已有登录态，直接复用")
+            return
+        print(f"{prefix}当前登录为 {current_email}，与目标 {username} 不一致，执行注销后重新登录")
+        _sign_out(driver)
+        login(driver, username, password)
+        return
+
+    print(f"{prefix}未能读取当前邮箱，默认注销后登录以确保账号匹配")
+    _sign_out(driver)
+    login(driver, username, password)
 
 
 def init_browser(s):
@@ -446,7 +685,7 @@ def _init_edge(headless_flag: str | None, mobile_emulation: dict | None):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
 def gohome(driver):
     try:
-        driver.get("https://rewards.bing.com/?ref=rewardspanel")
+        _safe_get(driver, "https://rewards.bing.com/?ref=rewardspanel")
     except Exception as e:
         print(f"跳转奖励面板失败：{e}")
         raise
@@ -567,28 +806,67 @@ def bing_search(driver, keyword):
             print(f"搜索 {keyword} 时元素失效，重试 {attempt + 1}")
             _random_sleep(short_range=(1, 2))
         except Exception as e:
+            if attempt < 2:
+                print(f"搜索 {keyword} 失败：{e}，重试 {attempt + 1}")
+                _random_sleep(short_range=(1, 2))
+                try:
+                    goSearch(driver)
+                except Exception:
+                    pass
+                continue
             print(f"搜索 {keyword} 失败：{e}")
             return
+
+
+def _pick_daily_set_key(data: dict) -> str | None:
+    if not data:
+        return None
+    today_key = datetime.now().strftime("%m/%d/%Y")
+    if today_key in data:
+        return today_key
+    keys = [k for k, v in data.items() if isinstance(v, list) and v]
+    if not keys:
+        return None
+    parsed = []
+    for key in keys:
+        try:
+            parsed.append((datetime.strptime(key, "%m/%d/%Y"), key))
+        except Exception:
+            continue
+    if parsed:
+        parsed.sort(reverse=True)
+        return parsed[0][1]
+    return keys[-1]
 
 
 def daily_set(driver):
     gohome(driver)
     dashboard = getDashboardData(driver)
     data = dashboard.get("dailySetPromotions", {})
-    todayDate = datetime.now().strftime("%m/%d/%Y")
-    for i in data.get(todayDate, []):
-        if i.get("attributes", {}).get("state") == "Complete":
+    key = _pick_daily_set_key(data)
+    if not key:
+        print("未获取到每日任务列表，跳过每日任务")
+        return
+    if key != datetime.now().strftime("%m/%d/%Y"):
+        print(f"未找到今日任务键，回退使用 {key}")
+    for index, item in enumerate(data.get(key, []), 1):
+        if item.get("attributes", {}).get("state") == "Complete":
             continue
-        cardId = int(i.get("offerId", "0")[-1:])
-        openDailySetActivity(driver, cardId)
+        openDailySetActivity(driver, index)
         time.sleep(random.randint(3, 5))
     gohome(driver)
     print("完成每日任务")
 
 
 def getDashboardData(driver) -> dict:
+    def _read_dashboard(d):
+        try:
+            return d.execute_script("return (typeof dashboard !== 'undefined') ? dashboard : null")
+        except Exception:
+            return None
+
     try:
-        data = driver.execute_script("return dashboard")
+        data = WebDriverWait(driver, DASHBOARD_WAIT_TIMEOUT).until(lambda d: _read_dashboard(d))
     except Exception as e:
         print(f"读取 dashboard 失败：{e}")
         return {}
@@ -596,28 +874,53 @@ def getDashboardData(driver) -> dict:
 
 
 def openDailySetActivity(driver, cardId: int):
-    try:
-        element = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable(
-                (
-                    By.XPATH,
-                    f'//*[@id="daily-sets"]/mee-card-group[1]/div/mee-card[{cardId}]/div/card-content/mee-rewards-daily-set-item-content/div/a',
+    for attempt in range(3):
+        try:
+            previous_handles = set(driver.window_handles)
+            element = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable(
+                    (
+                        By.XPATH,
+                        f'//*[@id="daily-sets"]/mee-card-group[1]/div/mee-card[{cardId}]/div/card-content/mee-rewards-daily-set-item-content/div/a',
+                    )
                 )
             )
-        )
-        element.click()
-        switchToNewTab(driver, 8)
-        closeCurrentTab(driver)
-    except Exception as e:
-        print(f"打开每日任务 {cardId} 失败：{e}")
+            element.click()
+            switchToNewTab(driver, 8, previous_handles=previous_handles)
+            closeCurrentTab(driver)
+            return
+        except Exception as e:
+            if attempt < 2:
+                print(f"打开每日任务 {cardId} 失败：{e}，重试 {attempt + 1}")
+                time.sleep(1.0)
+                continue
+            print(f"打开每日任务 {cardId} 失败：{e}")
+            return
 
 
-def switchToNewTab(driver, timeToWait: int = 0):
+def switchToNewTab(driver, timeToWait: int = 0, previous_handles: set[str] | None = None):
     handles = driver.window_handles
-    if len(handles) < 2:
+    if previous_handles is None:
+        if len(handles) < 2:
+            return
+        time.sleep(0.5)
+        driver.switch_to.window(window_name=handles[1])
+        if timeToWait > 0:
+            time.sleep(timeToWait)
         return
-    time.sleep(0.5)
-    driver.switch_to.window(window_name=handles[1])
+
+    prev = set(previous_handles)
+    try:
+        WebDriverWait(driver, 10).until(lambda d: len(d.window_handles) > len(prev))
+    except Exception:
+        pass
+    handles = driver.window_handles
+    target = next((h for h in handles if h not in prev), None)
+    if not target:
+        if len(handles) < 2:
+            return
+        target = handles[-1]
+    driver.switch_to.window(window_name=target)
     if timeToWait > 0:
         time.sleep(timeToWait)
 
@@ -636,7 +939,7 @@ def closeCurrentTab(driver):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
 def goSearch(driver):
     try:
-        driver.get("https://cn.bing.com/")
+        _safe_get(driver, "https://cn.bing.com/")
     except Exception as e:
         print(f"打开 Bing 失败：{e}")
         raise
@@ -691,7 +994,7 @@ def getZhihuTrends():
         words = []
         try:
             r = requests.get(
-                "https://api.cenguigui.cn/api/juhe/hotlist.php?type=zhihu",
+                "https://v2.xxapi.cn/api/douyinhot",
                 timeout=REQUEST_TIMEOUT,
                 headers=HTTP_HEADERS,
             )
@@ -701,7 +1004,7 @@ def getZhihuTrends():
             return words
         data = r.json().get("data", [])
         for trend in data:
-            title = trend.get("title")
+            title = trend.get("word")
             if title:
                 words.append(title)
         return words
@@ -741,28 +1044,28 @@ def _infer_search_points(target_total: int) -> int:
 
 
 def getRemainingSearches(driver):
-    dashboard = getDashboardData(driver)
-    if not dashboard:
-        return 0, 0
-    user_status = dashboard.get("userStatus", {})
-    counters = user_status.get("counters", {})
-    pcSearch = counters.get("pcSearch") or []
-    remainingDesktop = 0
-    if pcSearch:
-        progressDesktop = sum(item.get("pointProgress", 0) for item in pcSearch)
-        targetDesktop = sum(item.get("pointProgressMax", 0) for item in pcSearch)
-        search_points = _infer_search_points(targetDesktop)
-        remainingDesktop = max(0, int((targetDesktop - progressDesktop) / search_points))
-
-    remainingMobile = 0
-    level_info = user_status.get("levelInfo", {})
-    mobileSearch = counters.get("mobileSearch") or []
-    if level_info.get("activeLevel") != "Level1" and mobileSearch:
-        progressMobile = sum(item.get("pointProgress", 0) for item in mobileSearch)
-        targetMobile = sum(item.get("pointProgressMax", 0) for item in mobileSearch)
-        search_points = _infer_search_points(targetMobile)
-        remainingMobile = max(0, int((targetMobile - progressMobile) / search_points))
-    return remainingDesktop, remainingMobile
+    # dashboard = getDashboardData(driver)
+    # if not dashboard:
+    #     return 0, 0
+    # user_status = dashboard.get("userStatus", {})
+    # counters = user_status.get("counters", {})
+    # pcSearch = counters.get("pcSearch") or []
+    # remainingDesktop = 0
+    # if pcSearch:
+    #     progressDesktop = sum(item.get("pointProgress", 0) for item in pcSearch)
+    #     targetDesktop = sum(item.get("pointProgressMax", 0) for item in pcSearch)
+    #     search_points = _infer_search_points(targetDesktop)
+    #     remainingDesktop = max(0, int((targetDesktop - progressDesktop) / search_points))
+    #
+    # remainingMobile = 0
+    # level_info = user_status.get("levelInfo", {})
+    # mobileSearch = counters.get("mobileSearch") or []
+    # if level_info.get("activeLevel") != "Level1" and mobileSearch:
+    #     progressMobile = sum(item.get("pointProgress", 0) for item in mobileSearch)
+    #     targetMobile = sum(item.get("pointProgressMax", 0) for item in mobileSearch)
+    #     search_points = _infer_search_points(targetMobile)
+    #     remainingMobile = max(0, int((targetMobile - progressMobile) / search_points))
+    return random.randint(30,40), random.randint(30,40)
 
 
 def _ensure_keywords(*keyword_lists):
@@ -795,7 +1098,7 @@ def _search_loop(driver, keyword_list, searches: int, tag: str, extra_sleep: boo
         print(f"{tag} 未获取到关键词，跳过搜索")
         return
     cycle = _keyword_cycle(keyword_list)
-    for _ in tqdm(range(int(searches)), desc=f"{tag} bing searches", unit="search"):
+    for _ in tqdm(range(int(searches/3)), desc=f"{tag} bing searches", unit="search"):
         keyword = next(cycle)
         bing_search(driver, keyword)
         if extra_sleep:
@@ -803,37 +1106,31 @@ def _search_loop(driver, keyword_list, searches: int, tag: str, extra_sleep: boo
         _maybe_take_break(tag)
 
 
+def receive_points(driver):
+    gohome(driver)
+
+
+
+
 def _run_desktop_flow(username: str, password: str, headless_flag: str | None) -> int:
-    remaining_mobile = 0
     driver = init_browser(headless_flag)
     try:
-        # 若已有登录态则尝试个人中心读取邮箱
-        current_email = _detect_logged_in_email(driver)
-        if current_email:
-            if current_email == username.lower():
-                print("检测到已有登录态，直接复用")
-            else:
-                print(f"当前登录为 {current_email}，与目标 {username} 不一致，执行注销后重新登录")
-                _sign_out(driver)
-                login(driver, username, password)
-        else:
-            print("未能读取当前邮箱，默认注销后登录以确保账号匹配")
-            _sign_out(driver)
-            login(driver, username, password)
+        _ensure_logged_in(driver, username, password, tag="PC")
         gohome(driver)
         time.sleep(random.randint(2, 4))
         daily_set(driver)
         remaining_desktop, remaining_mobile = getRemainingSearches(driver)
         if remaining_desktop > 0:
             goSearch(driver)
+            _ensure_bing_account(driver, username, tag="PC")
             keyword_list = _ensure_keywords(
-                getDouYinTrends(),
                 getBaiduTrends(),
                 getZhihuTrends(),
             )
             _search_loop(driver, keyword_list, remaining_desktop, "PC")
         else:
             print("PC 无剩余搜索次数，跳过 PC 搜索")
+        receive_points(driver)
     finally:
         driver.quit()
     return remaining_mobile
@@ -845,24 +1142,13 @@ def _run_mobile_flow(username: str, password: str, headless_flag: str | None, re
         return
     driver = init_mobile_edge_appium(headless_flag)
     try:
-        current_email = _detect_logged_in_email(driver)
-        if current_email:
-            if current_email == username.lower():
-                print("移动端检测到已有登录态，直接复用")
-            else:
-                print(f"移动端当前登录为 {current_email}，与目标 {username} 不一致，注销后登录")
-                _sign_out(driver)
-                login(driver, username, password)
-        else:
-            print("移动端未能读取邮箱，默认先注销再登录确保账号一致")
-            _sign_out(driver)
-            login(driver, username, password)
+        _ensure_logged_in(driver, username, password, tag="移动端")
         gohome(driver)
         goSearch(driver)
+        _ensure_bing_account(driver, username, tag="移动端")
         keyword_list = _ensure_keywords(
             getBaiduTrends(),
-            getZhihuTrends(),
-            getDouYinTrends(),
+            getZhihuTrends()
         )
         _search_loop(driver, keyword_list, remaining_mobile, "Mobile", extra_sleep=True)
     finally:
@@ -895,6 +1181,10 @@ def main():
             _run_mobile_flow(username, password, s, remaining_mobile)
         else:
             print("移动端无剩余搜索次数，跳过移动端搜索")
+        #     领取积分
+
+
+
     print("所有账号处理完毕")
 
 
