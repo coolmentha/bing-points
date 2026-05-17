@@ -277,9 +277,9 @@ def test_search_loop_skip_when_no_keywords(monkeypatch):
 
 
 def test_parse_headless_flag():
-    assert main._parse_headless_flag(["main.py"]) is None
-    assert main._parse_headless_flag(["main.py", "headless"]) == "headless"
-    assert main._parse_headless_flag(["main.py", "--headless"]) == "--headless"
+    assert main._parse_headless_flag(["main_old.py"]) is None
+    assert main._parse_headless_flag(["main_old.py", "headless"]) == "headless"
+    assert main._parse_headless_flag(["main_old.py", "--headless"]) == "--headless"
 
 
 def test_run_desktop_flow_skip_search_when_no_remaining(monkeypatch):
