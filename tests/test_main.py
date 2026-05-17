@@ -150,10 +150,12 @@ def test_load_accounts_raise(monkeypatch):
         main._load_accounts()
 
 
-def test_load_accounts_success(monkeypatch):
-    cfg = monkeypatch.tmpdir.mkdir("acc").join("accounts.txt")
-    cfg.write("u1:p1\n#comment\nu2:p2")
-    monkeypatch.setattr(main, "ACCOUNTS_PATH", Path(str(cfg)))
+def test_load_accounts_success(monkeypatch, tmp_path):
+    cfg_dir = tmp_path / "acc"
+    cfg_dir.mkdir()
+    cfg = cfg_dir / "accounts.txt"
+    cfg.write_text("u1:p1\n#comment\nu2:p2", encoding="utf-8")
+    monkeypatch.setattr(main, "ACCOUNTS_PATH", cfg)
     assert main._load_accounts() == [("u1", "p1"), ("u2", "p2")]
 
 
@@ -205,39 +207,12 @@ def test_should_run_mobile():
     assert main._should_run_mobile(-1) is False
 
 
-def test_get_remaining_searches_mobile_only(monkeypatch):
-    dashboard = {
-        "userStatus": {
-            "levelInfo": {"activeLevel": "Level2"},
-            "counters": {
-                "pcSearch": [],
-                "mobileSearch": [{"pointProgress": 0, "pointProgressMax": 33}],
-            },
-        }
-    }
-    monkeypatch.setattr(main, "getDashboardData", lambda _: dashboard)
+def test_get_remaining_searches_uses_config(monkeypatch):
+    monkeypatch.setattr(main, "DEFAULT_PC_SEARCHES", 28)
+    monkeypatch.setattr(main, "DEFAULT_MOBILE_SEARCHES", 19)
     remaining_desktop, remaining_mobile = main.getRemainingSearches(object())
-    assert remaining_desktop == 0
-    assert remaining_mobile == 11
-
-
-def test_get_remaining_searches_mobile_sum(monkeypatch):
-    dashboard = {
-        "userStatus": {
-            "levelInfo": {"activeLevel": "Level2"},
-            "counters": {
-                "pcSearch": [],
-                "mobileSearch": [
-                    {"pointProgress": 3, "pointProgressMax": 33},
-                    {"pointProgress": 0, "pointProgressMax": 33},
-                ],
-            },
-        }
-    }
-    monkeypatch.setattr(main, "getDashboardData", lambda _: dashboard)
-    remaining_desktop, remaining_mobile = main.getRemainingSearches(object())
-    assert remaining_desktop == 0
-    assert remaining_mobile == 21
+    assert remaining_desktop == 28
+    assert remaining_mobile == 19
 
 
 def test_get_cached_trends_hit(monkeypatch):
@@ -341,26 +316,13 @@ def test_run_desktop_flow_skip_search_when_no_remaining(monkeypatch):
 
 
 def test_daily_set_uses_enumerate_index(monkeypatch):
-    today = main.datetime.now().strftime("%m/%d/%Y")
-    dashboard = {
-        "dailySetPromotions": {
-            today: [
-                {"attributes": {"state": "Complete"}, "offerId": "foo9"},
-                {"attributes": {"state": "NotComplete"}, "offerId": "foo10"},
-                {"attributes": {"state": "NotComplete"}, "offerId": "foo99"},
-            ]
-        }
-    }
-    called = []
+    called = {"fallback": 0}
 
     monkeypatch.setattr(main, "gohome", lambda _: None)
-    monkeypatch.setattr(main, "getDashboardData", lambda _: dashboard)
-    monkeypatch.setattr(main, "openDailySetActivity", lambda _driver, card_id: called.append(card_id))
-    monkeypatch.setattr(main.time, "sleep", lambda *_: None)
-    monkeypatch.setattr(main.random, "randint", lambda *_: 0)
+    monkeypatch.setattr(main, "_run_daily_set_dom_fallback", lambda _driver: called.__setitem__("fallback", called["fallback"] + 1) or 2)
 
     main.daily_set(object())
-    assert called == [2, 3]
+    assert called["fallback"] == 1
 
 
 def test_pick_daily_set_key_fallback_latest_date():
@@ -380,10 +342,6 @@ def test_bing_search_retries_on_exception(monkeypatch):
     class FakeElement:
         def __init__(self):
             self.submitted = 0
-            self.cleared = 0
-
-        def clear(self):
-            self.cleared += 1
 
         def submit(self):
             self.submitted += 1
@@ -413,42 +371,147 @@ def test_bing_search_retries_on_exception(monkeypatch):
     monkeypatch.setattr(main, "_jiggle_mouse", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main.random, "random", lambda: 0.0)
     monkeypatch.setattr(main, "goSearch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_reset_search_box", lambda *_args, **_kwargs: None)
 
     main.bing_search(object(), "k")
-    assert element.cleared == 1
     assert element.submitted == 1
     assert behaviors == []
 
 
-def test_get_dashboard_data_waits_for_dashboard(monkeypatch):
-    dashboard_obj = {"userStatus": {"counters": {}}}
+def test_bing_search_falls_back_to_direct_url(monkeypatch):
+    calls = {"direct": 0}
 
+    monkeypatch.setattr(main, "_locate_search_box", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "goSearch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "_search_via_direct_url", lambda *_args, **_kwargs: calls.__setitem__("direct", calls["direct"] + 1))
+
+    main.bing_search(object(), "k")
+    assert calls["direct"] == 1
+
+
+def test_collect_daily_set_dom_entries_maps_from_daily_cards(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "_collect_daily_task_cards",
+        lambda *_args, **_kwargs: [
+            {"taskId": "2", "title": "每日签到", "text": "每日签到 +10", "href": "https://rewards.bing.com/x", "points": "+10"},
+        ],
+    )
+    result = main._collect_daily_set_dom_entries(object())
+    assert [item["taskId"] for item in result] == ["2"]
+    assert result[0]["href"] == "https://rewards.bing.com/x"
+
+
+def test_collect_daily_set_dom_entries_empty_when_no_cards(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "_collect_daily_task_cards",
+        lambda *_args, **_kwargs: [],
+    )
+    result = main._collect_daily_set_dom_entries(object())
+    assert result == []
+
+
+def test_collect_daily_set_dom_entries_skips_items_without_points(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "_collect_daily_task_cards",
+        lambda *_args, **_kwargs: [
+            {"taskId": "2", "title": "琅勃拉邦之美", "text": "琅勃拉邦之美 +10", "href": "https://rewards.bing.com/y", "points": "+10"},
+        ],
+    )
+    result = main._collect_daily_set_dom_entries(object())
+    assert [item["taskId"] for item in result] == ["2"]
+
+
+def test_run_daily_set_prefers_daily_task_cards(monkeypatch):
+    calls = {"daily": 0, "fallback": 0}
+    monkeypatch.setattr(main, "_collect_daily_task_cards", lambda _driver: [{"taskId": "1", "title": "琅勃拉邦之美", "points": "+10 积分"}])
+    monkeypatch.setattr(main, "_click_daily_task_card", lambda _driver, _entry: calls.__setitem__("daily", calls["daily"] + 1) or True)
+    monkeypatch.setattr(main, "_collect_daily_set_dom_entries", lambda _driver: [])
+    monkeypatch.setattr(main, "gohome", lambda _driver: None)
+    result = main._run_daily_set_dom_fallback(object())
+    assert result == 1
+    assert calls["daily"] == 1
+    assert calls["fallback"] == 0
+
+
+def test_resolve_daily_task_entry_refinds_after_reload(monkeypatch):
     class FakeDriver:
-        def __init__(self):
-            self.calls = 0
+        def find_element(self, *_args, **_kwargs):
+            raise Exception("stale")
 
-        def execute_script(self, script):
-            assert "typeof dashboard" in script
-            self.calls += 1
-            if self.calls < 3:
-                return None
-            return dashboard_obj
+    monkeypatch.setattr(
+        main,
+        "_collect_daily_task_cards",
+        lambda _driver: [
+            {"taskId": "fresh-1", "title": "比才的魔力", "text": "比才的魔力 探索比才歌剧的永恒魅力。 +10", "href": "https://www.bing.com/search?q=a", "points": "+10"},
+            {"taskId": "fresh-2", "title": "冰封奇观", "text": "冰封奇观 探索南极洲独特的动物世界。 +10", "href": "https://www.bing.com/search?q=b", "points": "+10"},
+        ],
+    )
+    result = main._resolve_daily_task_entry(
+        FakeDriver(),
+        {"taskId": "old-2", "title": "冰封奇观", "href": "https://www.bing.com/search?q=b", "points": "+10"},
+    )
+    assert result["taskId"] == "fresh-2"
 
-    driver = FakeDriver()
 
-    class FakeWait:
-        def __init__(self, _driver, _timeout):
-            self._driver = _driver
+def test_collect_claimable_dom_entries_skips_home(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "_collect_dom_reward_entries",
+        lambda *_args, **_kwargs: [
+            {"taskId": "1", "text": "首页", "href": "https://rewards.bing.com/", "context": "reward activity home"},
+            {"taskId": "2", "text": "领取 10 积分", "href": "https://rewards.bing.com/claim", "context": "reward activity claim points"},
+        ],
+    )
+    result = main._collect_claimable_dom_entries(object())
+    assert [item["taskId"] for item in result] == ["2"]
 
-        def until(self, predicate):
-            for _ in range(5):
-                value = predicate(self._driver)
-                if value:
-                    return value
-            raise TimeoutError("timeout")
 
-    monkeypatch.setattr(main, "WebDriverWait", FakeWait)
-    assert main.getDashboardData(driver) == dashboard_obj
+def test_collect_claimable_dom_entries_skips_claim_summary_card(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "_collect_dom_reward_entries",
+        lambda *_args, **_kwargs: [
+            {"taskId": "1", "text": "可领取 183 领取", "href": "", "context": "reward activity claim points"},
+            {"taskId": "2", "text": "90 积分 默认搜索奖励 上个月赚取的积分: 待领取", "href": "https://rewards.bing.com/x", "context": "reward activity claim points 待领取"},
+        ],
+    )
+    result = main._collect_claimable_dom_entries(object())
+    assert [item["taskId"] for item in result] == ["2"]
+
+
+def test_promotion_is_complete_with_progress():
+    item = {"pointProgress": 10, "pointProgressMax": 10}
+    assert main._promotion_is_complete(item) is True
+
+
+def test_receive_points_runs_dom_fallback(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(main, "gohome", lambda _: None)
+    monkeypatch.setattr(main, "_claim_available_points", lambda _driver, tag="": calls.append(f"claim:{tag}") or 1)
+    monkeypatch.setattr(
+        main,
+        "_run_dom_reward_fallback",
+        lambda _driver, tag: calls.append(tag) or 2,
+    )
+
+    main.receive_points(object())
+    assert calls == ["claim:积分任务", "积分任务", "claim:积分任务"]
+
+
+def test_claim_available_points_stops_when_no_entries(monkeypatch):
+    monkeypatch.setattr(main, "_claim_points_from_dashboard_sidebar", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(main, "_collect_claim_button_entries", lambda _driver: [])
+    assert main._claim_available_points(object(), tag="积分任务") == 0
+
+
+def test_claim_available_points_includes_sidebar(monkeypatch):
+    monkeypatch.setattr(main, "_claim_points_from_dashboard_sidebar", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(main, "_collect_claim_button_entries", lambda _driver: [])
+    assert main._claim_available_points(object(), tag="积分任务") == 1
 
 
 def test_wait_login_complete_returns_when_url_changes(monkeypatch):

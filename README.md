@@ -1,12 +1,14 @@
 # Bing Points 自动化
 
-> 更新日期：2025-12-23 · 执行者：Codex
+> 更新日期：2026-04-20 · 执行者：Codex
 
 ## 功能简介
 - 自动完成 Microsoft Rewards：每日任务卡片、桌面/移动搜索积分。
+- 自动触发 Rewards 面板中的每日任务、Punch Card、额外积分任务，补上“打开面板但未真正领取/触发”的缺口。
 - 支持多账号轮询登录；如已处于正确登录态将直接复用，否则自动注销后登录。
 - 自动下载/定位 Edge WebDriver，默认优先本地 `msedgedriver.exe`。
-- 搜索次数按 Rewards 面板剩余次数精确执行：PC/移动端无剩余会自动跳过对应流程。
+- 搜索次数改为配置驱动：默认桌面 30 次、移动 20 次，可用环境变量覆盖，不再依赖 Rewards 页面内部状态。
+- 兼容新版入口：Rewards 面板与 Bing 搜索页都会按候选地址自动回退，减少因域名/入口切换导致的失败。
 
 ## 使用步骤
 1. 安装依赖（Python 3.10+）：`python -m pip install selenium requests selenium-stealth tenacity tqdm`
@@ -17,16 +19,22 @@
    # 可用逗号/分号/换行分隔，# 为注释
    ```
 3. 可选：将 Edge 驱动放在项目根目录命名为 `msedgedriver.exe`，或设置环境变量 `EDGEWEBDRIVER` 指向驱动路径。
-4. 运行脚本：`python main.py`（Linux/macOS 建议用 `python3 main.py`）
+4. 可选：如需修改搜索次数，可设置：
+   - `BING_REWARDS_PC_SEARCHES=30`
+   - `BING_REWARDS_MOBILE_SEARCHES=20`
+5. 运行脚本：`python main.py`（Linux/macOS 建议用 `python3 main.py`）
    - 无头模式：`python main.py headless`（也支持 `--headless` / `-h`）
    - 其他参数会被忽略并提示（避免误传参数导致无头）
 
 ## 稳定性机制（已内置）
 - 导航等待：关键页面访问使用“文档 readyState 等待”，降低页面未加载完成就找元素导致的失败。
-- Dashboard 等待：读取 `dashboard` 变量时会轮询等待其注入完成；失败会打印原因并回退空字典。
+- 纯 DOM 模式：不再尝试读取 `dashboard` 等前端内部变量，统一按页面真实可点击任务入口处理。
 - 每日任务日期回退：若 Rewards 返回的日期键与本地格式不一致，会自动回退到最新可用日期键。
-- 每日任务点击重试：打开每日任务卡片失败会自动重试（最多 3 次）。
+- 每日任务点击重试：优先按当前页面真实可点击链接定位，旧 XPath 作为兜底；打开失败会自动重试（最多 3 次）。
+- 任务触发更新：统一按 DOM 扫描每日任务、额外任务、可领取任务入口并逐个触发。
+- 额外积分领取：不再依赖页面内部 JSON 结构，而是直接扫描面板中的可领取按钮/链接。
 - 搜索自愈：搜索中途异常时，会尝试回到 Bing 首页再继续下一次重试。
+- 搜索框适配：除经典 `#sb_form_q` 外，也兼容新版 `name=q` / `textarea[name=q]` 搜索框。
 
 ## 登录逻辑要点
 - 登录前尝试从个人中心 `#feedback-root` 的配置 JSON 读取 `signInName` 确认当前账号；读取不到或与目标不符时，会访问注销链接并重新登录。

@@ -3,6 +3,8 @@ import re
 import sys
 import time
 import random
+import math
+from urllib.parse import quote_plus
 import zipfile
 import plistlib
 import tempfile
@@ -21,7 +23,7 @@ from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.edge.service import Service as EdgeService
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
-from selenium.common.exceptions import StaleElementReferenceException
+from selenium.common.exceptions import StaleElementReferenceException, InvalidElementStateException
 from selenium_stealth import stealth
 from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
@@ -32,8 +34,47 @@ DEFAULT_KEYWORDS = ["微软奖励", "必应搜索", "信息流热点", "今天�
 REQUEST_TIMEOUT = 8
 TRENDS_CACHE_FAILURE_TTL = 600
 NAVIGATION_TIMEOUT = 20
-DASHBOARD_WAIT_TIMEOUT = 15
 ACCOUNTS_PATH = Path(__file__).with_name("accounts.txt")
+DEFAULT_PC_SEARCHES = int(os.getenv("BING_REWARDS_PC_SEARCHES", "30"))
+DEFAULT_MOBILE_SEARCHES = int(os.getenv("BING_REWARDS_MOBILE_SEARCHES", "20"))
+REWARDS_HOME_URLS = [
+    url
+    for url in (
+        os.getenv("REWARDS_HOME_URL"),
+        "https://rewards.bing.com/dashboard",
+        "https://rewards.bing.com/?ref=rewardspanel",
+        "https://rewards.bing.com/",
+    )
+    if url
+]
+CLAIM_PANEL_TRIGGER_XPATH = '//*[@id="react-aria6979061832-_r_g6_"]/div/div'
+CLAIM_PANEL_BUTTON_XPATH = '//*[@id="react-aria6979061832-_r_ju_"]'
+DAILY_SECTION_SELECTOR = "#dailyset"
+CLAIM_CARD_XPATHS = [
+    CLAIM_PANEL_TRIGGER_XPATH,
+    "//*[@id='shell']//main//button[.//p[normalize-space()='可领取']]",
+    "//*[@id='shell']//main//button[contains(normalize-space(.), '可领取') and contains(normalize-space(.), '领取')]",
+]
+CLAIM_SUBMIT_XPATHS = [
+    CLAIM_PANEL_BUTTON_XPATH,
+    "//*[@role='dialog']//button[normalize-space()='领取积分']",
+    "//*[@role='dialog']//button[contains(normalize-space(.), '领取积分')]",
+]
+BING_HOME_URLS = [
+    url
+    for url in (
+        os.getenv("BING_SEARCH_URL"),
+        "https://www.bing.com/",
+        "https://cn.bing.com/",
+    )
+    if url
+]
+SEARCH_BOX_LOCATORS = [
+    (By.ID, "sb_form_q"),
+    (By.NAME, "q"),
+    (By.CSS_SELECTOR, "textarea[name='q']"),
+    (By.CSS_SELECTOR, "input[type='search']"),
+]
 EDGE_RELEASE_URLS = [
     "https://msedgewebdriverstorage.blob.core.windows.net/edgewebdriver/LATEST_RELEASE",
     "https://msedgedriver.azureedge.net/LATEST_RELEASE",
@@ -574,6 +615,17 @@ def _safe_get(driver, url: str, timeout: int = NAVIGATION_TIMEOUT):
     _wait_document_ready(driver, timeout=timeout)
 
 
+def _open_first_available(driver, urls: list[str], timeout: int = NAVIGATION_TIMEOUT):
+    last_exc = None
+    for url in urls:
+        try:
+            _safe_get(driver, url, timeout=timeout)
+            return url
+        except Exception as exc:
+            last_exc = exc
+    raise last_exc or RuntimeError("没有可用的目标地址")
+
+
 def _try_click(driver, by, locator) -> bool:
     try:
         elements = driver.find_elements(by, locator)
@@ -685,7 +737,7 @@ def _init_edge(headless_flag: str | None, mobile_emulation: dict | None):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
 def gohome(driver):
     try:
-        _safe_get(driver, "https://rewards.bing.com/?ref=rewardspanel")
+        _open_first_available(driver, REWARDS_HOME_URLS)
     except Exception as e:
         print(f"跳转奖励面板失败：{e}")
         raise
@@ -782,13 +834,68 @@ def _maybe_take_break(tag: str):
     time.sleep(duration)
 
 
+def _locate_search_box(driver, timeout: int = 10):
+    for by, locator in SEARCH_BOX_LOCATORS:
+        try:
+            element = WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, locator)))
+            if element is not None:
+                return element
+        except Exception:
+            continue
+    return None
+
+
+def _reset_search_box(driver, element):
+    try:
+        driver.execute_script("arguments[0].focus();", element)
+    except Exception:
+        pass
+    try:
+        element.click()
+    except Exception:
+        pass
+    try:
+        element.send_keys(Keys.CONTROL, "a")
+        element.send_keys(Keys.DELETE)
+        return
+    except (StaleElementReferenceException, InvalidElementStateException):
+        raise
+    except Exception:
+        pass
+    try:
+        driver.execute_script(
+            """
+            arguments[0].value = '';
+            arguments[0].dispatchEvent(new Event('input', {bubbles: true}));
+            arguments[0].dispatchEvent(new Event('change', {bubbles: true}));
+            """,
+            element,
+        )
+    except Exception:
+        pass
+
+
+def _search_via_direct_url(driver, keyword: str):
+    search_url = f"https://www.bing.com/search?q={quote_plus(keyword)}"
+    _safe_get(driver, search_url)
+    _random_sleep(short_range=(3, 5), long_prob=0.2, long_range=(6, 10))
+    _random_scroll_results(driver)
+    _random_click_result(driver)
+    _jiggle_mouse(driver)
+
+
 def bing_search(driver, keyword):
     for attempt in range(3):
         try:
-            element = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, '//*[@id="sb_form_q"]'))
-            )
-            element.clear()
+            if attempt > 0:
+                goSearch(driver)
+            element = _locate_search_box(driver, timeout=10)
+            if element is None:
+                if attempt >= 1:
+                    _search_via_direct_url(driver, keyword)
+                    return
+                raise RuntimeError("未找到 Bing 搜索框")
+            _reset_search_box(driver, element)
             _random_sleep(short_range=(2, 4), long_prob=0.4, long_range=(5, 10))
             _type_keyword(element, keyword)
             _maybe_select_suggestion(element)
@@ -802,7 +909,7 @@ def bing_search(driver, keyword):
             _random_click_result(driver)
             _jiggle_mouse(driver)
             return
-        except StaleElementReferenceException:
+        except (StaleElementReferenceException, InvalidElementStateException):
             print(f"搜索 {keyword} 时元素失效，重试 {attempt + 1}")
             _random_sleep(short_range=(1, 2))
         except Exception as e:
@@ -839,55 +946,985 @@ def _pick_daily_set_key(data: dict) -> str | None:
     return keys[-1]
 
 
+def _safe_int(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _promotion_title(item: dict) -> str:
+    return (item.get("title") or item.get("name") or item.get("offerId") or "未命名任务").strip()
+
+
+def _normalize_text(text: str | None) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip()).lower()
+
+
+def _contains_any_keyword(text: str | None, keywords: list[str] | tuple[str, ...]) -> bool:
+    normalized = _normalize_text(text)
+    return any(keyword.lower() in normalized for keyword in keywords)
+
+
+def _is_generic_nav_entry(text: str | None, context: str | None = None, href: str | None = None) -> bool:
+    combined = " ".join(
+        part for part in (_normalize_text(text), _normalize_text(context), _normalize_text(href)) if part
+    )
+    blocked_keywords = (
+        "首页",
+        "home",
+        "homepage",
+        "earn more",
+        "赚取更多",
+        "learn more",
+        "了解更多",
+        "discover more",
+        "更多奖励",
+        "rewards dashboard",
+        "rewardspanel",
+    )
+    return any(keyword in combined for keyword in blocked_keywords)
+
+
+def _promotion_offer_id(item: dict) -> str:
+    return (item.get("offerId") or item.get("offerid") or item.get("name") or "").strip()
+
+
+def _promotion_target_url(item: dict) -> str:
+    attributes = item.get("attributes") if isinstance(item.get("attributes"), dict) else {}
+    for candidate in (
+        item.get("destinationUrl"),
+        item.get("destination"),
+        attributes.get("destination"),
+        attributes.get("destinationUrl"),
+        item.get("deeplink"),
+    ):
+        if candidate and str(candidate).strip():
+            return str(candidate).strip()
+    return ""
+
+
+def _promotion_points_total(item: dict) -> int:
+    return max(
+        _safe_int(item.get("pointProgressMax")),
+        _safe_int(item.get("activityProgressMax")),
+        _safe_int(item.get("max")),
+        _safe_int((item.get("attributes") or {}).get("max") if isinstance(item.get("attributes"), dict) else 0),
+    )
+
+
+def _promotion_progress(item: dict) -> int:
+    return max(
+        _safe_int(item.get("pointProgress")),
+        _safe_int(item.get("activityProgress")),
+        _safe_int(item.get("progress")),
+        _safe_int((item.get("attributes") or {}).get("progress") if isinstance(item.get("attributes"), dict) else 0),
+    )
+
+
+def _promotion_is_complete(item: dict) -> bool:
+    if item.get("complete") is True:
+        return True
+    attributes = item.get("attributes") if isinstance(item.get("attributes"), dict) else {}
+    state = str(attributes.get("state") or item.get("state") or "").strip().lower()
+    if state == "complete":
+        return True
+    total = _promotion_points_total(item)
+    progress = _promotion_progress(item)
+    return bool(total > 0 and progress >= total)
+
+
+def _promotion_is_locked(item: dict) -> bool:
+    if item.get("isHidden") is True:
+        return True
+    locked_status = str(item.get("exclusiveLockedFeatureStatus") or "").strip().lower()
+    return locked_status == "locked"
+
+
+def _promotion_can_trigger(item: dict) -> bool:
+    if not isinstance(item, dict) or _promotion_is_complete(item) or _promotion_is_locked(item):
+        return False
+    if _promotion_target_url(item):
+        return True
+    return _promotion_points_total(item) > 0
+
+
+def _dedupe_promotions(items: list[dict]) -> list[dict]:
+    deduped = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        signature = (
+            _promotion_offer_id(item),
+            _promotion_target_url(item),
+            _promotion_title(item),
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(item)
+    return deduped
+
+
+def _find_promotion_link(driver, promotion: dict):
+    offer_id = _promotion_offer_id(promotion)
+    target_url = _promotion_target_url(promotion)
+    title = _promotion_title(promotion)
+
+    selectors = []
+    if offer_id:
+        selectors.extend(
+            [
+                (By.CSS_SELECTOR, f'[data-offer-id="{offer_id}"] a[href]'),
+                (By.CSS_SELECTOR, f'[data-offer-id="{offer_id}"]'),
+                (By.CSS_SELECTOR, f'a[href*="{offer_id}"]'),
+            ]
+        )
+    if target_url:
+        selectors.append((By.CSS_SELECTOR, f'a[href="{target_url}"]'))
+
+    for by, selector in selectors:
+        try:
+            elements = driver.find_elements(by, selector)
+        except Exception:
+            continue
+        for element in elements:
+            try:
+                if element.is_displayed():
+                    return element
+            except Exception:
+                continue
+
+    if title:
+        try:
+            elements = driver.find_elements(By.CSS_SELECTOR, "a, button, [role='button']")
+        except Exception:
+            elements = []
+        normalized = re.sub(r"\s+", "", title)
+        for element in elements:
+            try:
+                text = re.sub(r"\s+", "", (element.text or "").strip())
+            except StaleElementReferenceException:
+                continue
+            if not text:
+                continue
+            if text == normalized or normalized in text or text in normalized:
+                return element
+    return None
+
+
+def _open_promotion_url(driver, url: str, wait_seconds: int = 8) -> bool:
+    previous_handles = set(driver.window_handles)
+    previous_url = (getattr(driver, "current_url", "") or "").strip()
+    try:
+        driver.execute_script("window.open(arguments[0], '_blank');", url)
+        switchToNewTab(driver, timeToWait=0, previous_handles=previous_handles)
+        _wait_document_ready(driver, timeout=10)
+        time.sleep(wait_seconds)
+        closeCurrentTab(driver)
+        return True
+    except Exception:
+        try:
+            _safe_get(driver, url)
+            time.sleep(wait_seconds)
+            driver.back()
+            _wait_document_ready(driver, timeout=10)
+            return True
+        except Exception:
+            try:
+                if getattr(driver, "current_url", "") != previous_url:
+                    driver.get(previous_url)
+            except Exception:
+                pass
+            return False
+
+
+def _trigger_promotion(driver, promotion: dict, wait_seconds: int = 8, tag: str = "") -> bool:
+    title = _promotion_title(promotion)
+    prefix = f"{tag} " if tag else ""
+    target_url = _promotion_target_url(promotion)
+    if target_url and _open_promotion_url(driver, target_url, wait_seconds=wait_seconds):
+        print(f"{prefix}已触发任务：{title}")
+        return True
+
+    try:
+        element = _find_promotion_link(driver, promotion)
+        if element is None:
+            print(f"{prefix}未找到任务入口：{title}")
+            return False
+        previous_handles = set(driver.window_handles)
+        previous_url = (getattr(driver, "current_url", "") or "").strip()
+        _click_element(driver, element)
+        open_state = _wait_for_activity_open(driver, previous_handles, previous_url, timeout=10)
+        if open_state == "new_tab":
+            switchToNewTab(driver, timeToWait=wait_seconds, previous_handles=previous_handles)
+            closeCurrentTab(driver)
+        elif open_state == "same_tab":
+            time.sleep(wait_seconds)
+            driver.back()
+            _wait_document_ready(driver, timeout=10)
+        else:
+            time.sleep(wait_seconds)
+        print(f"{prefix}已触发任务：{title}")
+        return True
+    except Exception as exc:
+        print(f"{prefix}触发任务失败：{title}，原因：{exc}")
+        return False
+
+
 def daily_set(driver):
     gohome(driver)
-    dashboard = getDashboardData(driver)
-    data = dashboard.get("dailySetPromotions", {})
-    key = _pick_daily_set_key(data)
-    if not key:
-        print("未获取到每日任务列表，跳过每日任务")
+    completed = _run_daily_set_dom_fallback(driver)
+    if completed <= 0:
+        print("未找到每日任务入口，跳过每日任务")
         return
-    if key != datetime.now().strftime("%m/%d/%Y"):
-        print(f"未找到今日任务键，回退使用 {key}")
-    for index, item in enumerate(data.get(key, []), 1):
-        if item.get("attributes", {}).get("state") == "Complete":
-            continue
-        openDailySetActivity(driver, index)
-        time.sleep(random.randint(3, 5))
     gohome(driver)
     print("完成每日任务")
 
 
-def getDashboardData(driver) -> dict:
-    def _read_dashboard(d):
+def _collect_daily_set_links(driver):
+    selectors = [
+        "#daily-sets a[href]",
+        "mee-card-group a[href]",
+        "mee-card a[href]",
+        "a[href*='rewards.bing.com']",
+    ]
+    links = []
+    seen = set()
+    for selector in selectors:
         try:
-            return d.execute_script("return (typeof dashboard !== 'undefined') ? dashboard : null")
+            elements = driver.find_elements(By.CSS_SELECTOR, selector)
         except Exception:
-            return None
+            continue
+        for element in elements:
+            try:
+                href = (element.get_attribute("href") or "").strip()
+                text = (element.text or "").strip()
+            except StaleElementReferenceException:
+                continue
+            if not href:
+                continue
+            signature = (href, text)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            links.append(element)
+    return links
+
+
+def _collect_dom_reward_entries(
+    driver,
+    section_keywords: list[str] | tuple[str, ...],
+    action_keywords: list[str] | tuple[str, ...] | None = None,
+):
+    try:
+        entries = driver.execute_script(
+            """
+            const sectionKeywords = (arguments[0] || []).map(x => String(x).toLowerCase());
+            const actionKeywords = (arguments[1] || []).map(x => String(x).toLowerCase());
+            const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            const visible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+            const getContext = (el) => {
+                const parts = [];
+                let node = el;
+                for (let i = 0; i < 6 && node; i += 1) {
+                    parts.push(
+                        normalize(node.id),
+                        normalize(node.className),
+                        normalize((node.getAttribute && node.getAttribute('aria-label')) || ''),
+                        normalize((node.innerText || node.textContent || '').slice(0, 180))
+                    );
+                    node = node.parentElement;
+                }
+                return parts.join(' ');
+            };
+
+            const results = [];
+            let index = 0;
+            for (const el of document.querySelectorAll("a[href], button, [role='button']")) {
+                if (!visible(el)) {
+                    continue;
+                }
+                const text = normalize(el.innerText || el.textContent || '');
+                const href = normalize(el.getAttribute && el.getAttribute('href'));
+                const context = getContext(el);
+                if (!text && (!href || href === '/' || href === '#')) {
+                    continue;
+                }
+                if (href === '/' || href === '#' || href.startsWith('javascript:')) {
+                    continue;
+                }
+                if (!sectionKeywords.some(keyword => context.includes(keyword))) {
+                    continue;
+                }
+                if (actionKeywords.length && !actionKeywords.some(keyword => text.includes(keyword) || context.includes(keyword))) {
+                    continue;
+                }
+                index += 1;
+                const taskId = `codex-task-${Date.now()}-${index}`;
+                el.setAttribute('data-codex-task-id', taskId);
+                results.push({
+                    taskId,
+                    text,
+                    href,
+                    context,
+                });
+            }
+            return results;
+            """,
+            list(section_keywords),
+            list(action_keywords or []),
+        )
+    except Exception:
+        return []
+
+    deduped = []
+    seen = set()
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        signature = (
+            entry.get("href", ""),
+            entry.get("text", ""),
+            entry.get("context", "")[:120],
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(entry)
+    return deduped
+
+
+def _collect_daily_set_dom_entries(driver):
+    cards = _collect_daily_task_cards(driver)
+    if not cards:
+        return []
+
+    results = []
+    for entry in cards:
+        task_id = (entry.get("taskId") or "").strip()
+        if not task_id:
+            continue
+        results.append(
+            {
+                "taskId": task_id,
+                "text": entry.get("text", ""),
+                "href": entry.get("href", ""),
+                "context": f"dailyset {entry.get('title', '')} {entry.get('points', '')}",
+            }
+        )
+    return results
+
+
+def _collect_daily_task_cards(driver):
+    try:
+        WebDriverWait(driver, 12).until(
+            lambda d: d.find_elements(By.CSS_SELECTOR, DAILY_SECTION_SELECTOR)
+            or d.find_elements(By.XPATH, "//section[@id='dailyset']")
+            or d.find_elements(By.XPATH, "//section[.//h2[normalize-space()='每日活动']]")
+            or d.find_elements(By.XPATH, "//h2[normalize-space()='每日活动']")
+        )
+    except Exception:
+        pass
 
     try:
-        data = WebDriverWait(driver, DASHBOARD_WAIT_TIMEOUT).until(lambda d: _read_dashboard(d))
-    except Exception as e:
-        print(f"读取 dashboard 失败：{e}")
-        return {}
-    return data or {}
+        entries = driver.execute_script(
+            """
+            const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+            const visible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+            const pointPattern = /(?:\\+?\\d+)\\s*(?:points?|积分)/i;
+            const dailyUrlPattern = /(form=ml2g76|form=dsetqu|reward?sdo|dailyset|gamification_dailyset)/i;
+            const dailySection =
+                document.querySelector(arguments[0]) ||
+                document.querySelector("section#dailyset") ||
+                Array.from(document.querySelectorAll("section")).find((el) =>
+                    /每日活动/i.test(normalize(el.innerText || el.textContent || ''))
+                );
+            const candidates = [];
+            let index = 0;
+            const elements = dailySection
+                ? (dailySection.querySelectorAll("a[href]") || [])
+                : document.querySelectorAll("a[href]");
+            for (const el of elements) {
+                if (!visible(el)) {
+                    continue;
+                }
+                const text = normalize(el.innerText || el.textContent || '');
+                const href = normalize((el.getAttribute && el.getAttribute('href')) || '');
+                if (!text || !pointPattern.test(text)) {
+                    continue;
+                }
+                if (text.includes('每日活动') || text.includes('赚取更多') || text.includes('了解更多')) {
+                    continue;
+                }
+                if (!dailySection && !dailyUrlPattern.test(href)) {
+                    continue;
+                }
+                const match = text.match(pointPattern);
+                const points = match ? match[0] : '';
+                const title = text.replace(pointPattern, '').trim().split('\\n')[0].trim() || text;
+                if (!title || title === '领取' || title === '可领取') {
+                    continue;
+                }
+                index += 1;
+                const taskId = `codex-daily-${Date.now()}-${index}`;
+                el.setAttribute('data-codex-daily-id', taskId);
+                candidates.push({taskId, title, text, href, points});
+            }
+            return candidates;
+            """,
+            DAILY_SECTION_SELECTOR,
+        )
+    except Exception:
+        entries = []
+
+    deduped = []
+    seen = set()
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        signature = (
+            entry.get("title", ""),
+            entry.get("points", ""),
+            entry.get("href", ""),
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(entry)
+    if deduped:
+        return deduped
+
+    try:
+        containers = driver.find_elements(By.XPATH, "//section[@id='dailyset']") or driver.find_elements(
+            By.XPATH, "//section[.//h2[normalize-space()='每日活动']]"
+        )
+    except Exception:
+        containers = []
+    fallback_entries = []
+    seen = set()
+    elements = []
+    if containers:
+        section = containers[0]
+        try:
+            elements = section.find_elements(By.XPATH, ".//a[@href]")
+            if not elements:
+                elements = section.find_elements(By.XPATH, ".//button[.//*[contains(normalize-space(.), '+')] or contains(normalize-space(.), '积分')]")
+        except Exception:
+            elements = []
+    if not elements:
+        try:
+            elements = driver.find_elements(
+                By.XPATH,
+                "//a[contains(@href,'form=ML2G76') or contains(@href,'form=dsetqu') or contains(@href,'RewardsDO') or contains(@href,'DailySet')]",
+            )
+        except Exception:
+            elements = []
+    for index, element in enumerate(elements, 1):
+        try:
+            text = re.sub(r"\s+", " ", (element.text or "").strip())
+            href = (element.get_attribute("href") or "").strip()
+        except Exception:
+            continue
+        if not text:
+            continue
+        if ("+" not in text and "积分" not in text) or "每日活动" in text or "赚取更多" in text or "了解更多" in text:
+            continue
+        points_match = re.search(r"(\+\d+\s*(?:积分|points?)?|\d+\s*积分)", text, re.I)
+        if not points_match:
+            continue
+        points = points_match.group(1).strip()
+        title = re.sub(r"\s+", " ", text.replace(points, "")).strip().split("\n")[0].strip()
+        if not title:
+            continue
+        signature = (title, points, href)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        task_id = f"codex-daily-fallback-{int(time.time() * 1000)}-{index}"
+        try:
+            driver.execute_script("arguments[0].setAttribute('data-codex-daily-id', arguments[1]);", element, task_id)
+        except Exception:
+            continue
+        fallback_entries.append({"taskId": task_id, "title": title, "text": text, "href": href, "points": points})
+    return fallback_entries
+
+
+def _resolve_daily_task_entry(driver, entry: dict) -> dict | None:
+    task_id = (entry.get("taskId") or "").strip()
+    if task_id:
+        try:
+            driver.find_element(By.CSS_SELECTOR, f'[data-codex-daily-id="{task_id}"]')
+            return entry
+        except Exception:
+            pass
+
+    target_href = (entry.get("href") or "").strip()
+    target_title = _normalize_text(entry.get("title") or entry.get("text") or "")
+    target_points = _normalize_text(entry.get("points") or "")
+
+    fresh_cards = _collect_daily_task_cards(driver)
+    if not fresh_cards:
+        return None
+
+    if target_href:
+        for candidate in fresh_cards:
+            if (candidate.get("href") or "").strip() == target_href:
+                return candidate
+
+    for candidate in fresh_cards:
+        candidate_title = _normalize_text(candidate.get("title") or candidate.get("text") or "")
+        candidate_points = _normalize_text(candidate.get("points") or "")
+        if candidate_title == target_title and (not target_points or candidate_points == target_points):
+            return candidate
+
+    for candidate in fresh_cards:
+        candidate_text = _normalize_text(candidate.get("text") or "")
+        if target_title and (target_title in candidate_text or candidate_text in target_title):
+            return candidate
+    return None
+
+
+def _click_daily_task_card(driver, entry: dict) -> bool:
+    entry = _resolve_daily_task_entry(driver, entry) or entry
+    task_id = entry.get("taskId")
+    title = (entry.get("title") or entry.get("text") or "未命名日常任务").strip()
+    points = (entry.get("points") or "").strip()
+    if not task_id:
+        return False
+    try:
+        element = driver.find_element(By.CSS_SELECTOR, f'[data-codex-daily-id="{task_id}"]')
+    except Exception:
+        return False
+
+    previous_handles = set(driver.window_handles)
+    previous_url = (getattr(driver, "current_url", "") or "").strip()
+    try:
+        _click_element(driver, element)
+        open_state = _wait_for_activity_open(driver, previous_handles, previous_url, timeout=10)
+        if open_state == "new_tab":
+            switchToNewTab(driver, timeToWait=random.randint(6, 10), previous_handles=previous_handles)
+            closeCurrentTab(driver)
+        elif open_state == "same_tab":
+            time.sleep(random.randint(6, 10))
+            driver.back()
+            _wait_document_ready(driver, timeout=10)
+        else:
+            href = (entry.get("href") or "").strip()
+            if href:
+                return _open_promotion_url(driver, href, wait_seconds=random.randint(6, 10))
+        print(f"日常任务 触发任务：{title} {points}".strip())
+        return True
+    except Exception:
+        href = (entry.get("href") or "").strip()
+        if href:
+            ok = _open_promotion_url(driver, href, wait_seconds=random.randint(6, 10))
+            if ok:
+                print(f"日常任务 触发任务：{title} {points}".strip())
+            return ok
+        return False
+
+
+def _click_reward_entry(driver, entry: dict, wait_seconds: int = 8, tag: str = "") -> bool:
+    task_id = entry.get("taskId")
+    title = (entry.get("text") or entry.get("context") or entry.get("href") or "未命名任务").strip()
+    if not task_id:
+        return False
+    try:
+        element = driver.find_element(By.CSS_SELECTOR, f'[data-codex-task-id="{task_id}"]')
+    except Exception:
+        return False
+
+    previous_handles = set(driver.window_handles)
+    previous_url = (getattr(driver, "current_url", "") or "").strip()
+    try:
+        _click_element(driver, element)
+        open_state = _wait_for_activity_open(driver, previous_handles, previous_url, timeout=10)
+        if open_state == "new_tab":
+            switchToNewTab(driver, timeToWait=wait_seconds, previous_handles=previous_handles)
+            closeCurrentTab(driver)
+        elif open_state == "same_tab":
+            time.sleep(wait_seconds)
+            driver.back()
+            _wait_document_ready(driver, timeout=10)
+        else:
+            href = entry.get("href", "")
+            if href:
+                return _open_promotion_url(driver, href, wait_seconds=wait_seconds)
+            time.sleep(wait_seconds)
+        if tag:
+            print(f"{tag} DOM 触发任务：{title}")
+        return True
+    except Exception:
+        href = entry.get("href", "")
+        if href:
+            ok = _open_promotion_url(driver, href, wait_seconds=wait_seconds)
+            if ok and tag:
+                print(f"{tag} DOM 触发任务：{title}")
+            return ok
+        return False
+
+
+def _run_daily_set_dom_fallback(driver) -> int:
+    for attempt in range(2):
+        daily_cards = _collect_daily_task_cards(driver)
+        if daily_cards:
+            completed = 0
+            for entry in daily_cards[:3]:
+                if _click_daily_task_card(driver, entry):
+                    completed += 1
+                    try:
+                        gohome(driver)
+                    except Exception:
+                        pass
+            print(f"日常任务触发 {completed}/{min(len(daily_cards), 3)} 个")
+            return completed
+
+        entries = _collect_daily_set_dom_entries(driver)
+        if entries:
+            completed = 0
+            for entry in entries[:3]:
+                if _click_reward_entry(driver, entry, wait_seconds=random.randint(6, 10), tag="每日任务"):
+                    completed += 1
+                    try:
+                        gohome(driver)
+                    except Exception:
+                        pass
+            print(f"DOM 回退触发每日任务 {completed}/{min(len(entries), 3)} 个")
+            return completed
+
+        if attempt == 0:
+            try:
+                _random_sleep(short_range=(2, 3))
+                gohome(driver)
+                continue
+            except Exception:
+                pass
+
+    print("DOM 回退也未找到每日任务入口")
+    return 0
+
+
+def _collect_claimable_dom_entries(driver):
+    section_keywords = (
+        "more activities",
+        "more promotions",
+        "punch",
+        "offer",
+        "promotion",
+        "activity",
+        "奖励",
+        "积分",
+        "活动",
+        "任务",
+    )
+    action_keywords = (
+        "claim",
+        "open",
+        "earn",
+        "start",
+        "play",
+        "join",
+        "get",
+        "领取",
+        "打开",
+        "开始",
+        "赚取",
+        "获取",
+    )
+    entries = _collect_dom_reward_entries(driver, section_keywords, action_keywords=action_keywords)
+    blocked_keywords = ("complete", "completed", "done", "已完成")
+    results = []
+    for entry in entries:
+        text = entry.get("text", "")
+        context = entry.get("context", "")
+        href = entry.get("href", "")
+        if any(keyword in text or keyword in context for keyword in blocked_keywords):
+            continue
+        if _is_generic_nav_entry(text, context, href):
+            continue
+        if "bing.com/search" in href or "bing.com/?" in href:
+            continue
+        if "可领取" in text and "待领取" not in text:
+            continue
+        if not (
+            _contains_any_keyword(text, ("claim", "领取", "open", "earn", "start", "join", "play", "get", "赚取", "获取"))
+            or _contains_any_keyword(context, ("points", "积分", "rewards", "奖励", "activity", "活动", "offer", "promotion"))
+        ):
+            continue
+        if not (
+            _contains_any_keyword(text, ("待领取", "claim", "领取", "获取"))
+            or _contains_any_keyword(context, ("待领取", "claim", "领取", "获取"))
+        ):
+            continue
+        results.append(entry)
+    return results
+
+
+def _collect_claim_button_entries(driver):
+    claim_keywords = (
+        "claim",
+        "claim now",
+        "claim points",
+        "get reward",
+        "领取",
+        "立即领取",
+        "领取积分",
+        "获取积分",
+    )
+    blocked_keywords = (
+        "redeem",
+        "gift card",
+        "donate",
+        "兑换",
+        "捐赠",
+    )
+    try:
+        entries = driver.execute_script(
+            """
+            const claimKeywords = (arguments[0] || []).map(x => String(x).toLowerCase());
+            const blockedKeywords = (arguments[1] || []).map(x => String(x).toLowerCase());
+            const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            const visible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+            const results = [];
+            let index = 0;
+            for (const el of document.querySelectorAll("button, a[href], [role='button']")) {
+                if (!visible(el)) {
+                    continue;
+                }
+                const text = normalize(el.innerText || el.textContent || '');
+                const aria = normalize((el.getAttribute && el.getAttribute('aria-label')) || '');
+                const href = normalize((el.getAttribute && el.getAttribute('href')) || '');
+                const context = `${text} ${aria} ${href}`;
+                if (!claimKeywords.some(keyword => context.includes(keyword))) {
+                    continue;
+                }
+                if (blockedKeywords.some(keyword => context.includes(keyword))) {
+                    continue;
+                }
+                if (href.includes('redeem') || href.includes('giftcards')) {
+                    continue;
+                }
+                if (context.includes('可领取') && !context.includes('领取积分') && !context.includes('claim points')) {
+                    continue;
+                }
+                index += 1;
+                const taskId = `codex-claim-${Date.now()}-${index}`;
+                el.setAttribute('data-codex-claim-id', taskId);
+                results.push({taskId, text, href, context});
+            }
+            return results;
+            """,
+            list(claim_keywords),
+            list(blocked_keywords),
+        )
+    except Exception:
+        return []
+
+    deduped = []
+    seen = set()
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        signature = (entry.get("text", ""), entry.get("href", ""))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(entry)
+    return deduped
+
+
+def _claim_points_from_dashboard_sidebar(driver, tag: str = "积分任务") -> int:
+    claimed = 0
+    try:
+        _safe_get(driver, "https://rewards.bing.com/dashboard")
+        WebDriverWait(driver, 10).until(
+            lambda d: d.find_elements(By.ID, "shell") or d.find_elements(By.XPATH, "//*[@id='shell']//main")
+        )
+    except Exception:
+        return 0
+
+    for _ in range(3):
+        try:
+            dialog_open = None
+            try:
+                dialog_open = driver.find_element(By.XPATH, "//*[@role='dialog']")
+            except Exception:
+                dialog_open = None
+
+            if dialog_open is None:
+                trigger = None
+                for xpath in CLAIM_CARD_XPATHS:
+                    try:
+                        trigger = WebDriverWait(driver, 4).until(
+                            EC.element_to_be_clickable((By.XPATH, xpath))
+                        )
+                        if trigger is not None:
+                            break
+                    except Exception:
+                        continue
+                if trigger is None:
+                    break
+                _click_element(driver, trigger)
+                WebDriverWait(driver, 6).until(
+                    EC.presence_of_element_located((By.XPATH, "//*[@role='dialog']"))
+                )
+            claim_button = None
+            for xpath in CLAIM_SUBMIT_XPATHS:
+                try:
+                    claim_button = WebDriverWait(driver, 4).until(
+                        EC.element_to_be_clickable((By.XPATH, xpath))
+                    )
+                    if claim_button is not None:
+                        break
+                except Exception:
+                    continue
+            if claim_button is None:
+                break
+            _click_element(driver, claim_button)
+            claimed += 1
+            print(f"{tag} 侧边栏领取成功")
+            try:
+                WebDriverWait(driver, 8).until_not(
+                    EC.presence_of_element_located((By.XPATH, "//*[@role='dialog']"))
+                )
+            except Exception:
+                pass
+            _random_sleep(short_range=(1, 2))
+            _safe_get(driver, "https://rewards.bing.com/dashboard")
+        except Exception:
+            break
+    return claimed
+
+
+def _click_claim_entry(driver, entry: dict, tag: str = "") -> bool:
+    claim_id = entry.get("taskId")
+    title = (entry.get("text") or entry.get("context") or "claim").strip()
+    if not claim_id:
+        return False
+    try:
+        element = driver.find_element(By.CSS_SELECTOR, f'[data-codex-claim-id="{claim_id}"]')
+    except Exception:
+        return False
+
+    previous_handles = set(driver.window_handles)
+    previous_url = (getattr(driver, "current_url", "") or "").strip()
+    try:
+        _click_element(driver, element)
+        open_state = _wait_for_activity_open(driver, previous_handles, previous_url, timeout=6)
+        if open_state == "new_tab":
+            switchToNewTab(driver, timeToWait=3, previous_handles=previous_handles)
+            closeCurrentTab(driver)
+        elif open_state == "same_tab":
+            time.sleep(3)
+            if "rewards" not in (getattr(driver, "current_url", "") or "").lower():
+                driver.back()
+                _wait_document_ready(driver, timeout=10)
+        else:
+            time.sleep(2)
+        if tag:
+            print(f"{tag} 点击领取：{title}")
+        return True
+    except Exception:
+        return False
+
+
+def _claim_available_points(driver, tag: str = "积分任务") -> int:
+    claimed = _claim_points_from_dashboard_sidebar(driver, tag=tag)
+    for _ in range(3):
+        entries = _collect_claim_button_entries(driver)
+        if not entries:
+            break
+        clicked = False
+        for entry in entries:
+            if _click_claim_entry(driver, entry, tag=tag):
+                claimed += 1
+                clicked = True
+                _random_sleep(short_range=(1, 2))
+                try:
+                    gohome(driver)
+                except Exception:
+                    pass
+                break
+        if not clicked:
+            break
+    if claimed:
+        print(f"{tag} 已领取 {claimed} 次")
+    return claimed
+
+
+def _run_dom_reward_fallback(driver, tag: str) -> int:
+    entries = _collect_claimable_dom_entries(driver)
+    if not entries:
+        print(f"{tag} DOM 回退未找到可领取任务")
+        return 0
+    completed = 0
+    for entry in entries[:8]:
+        if _click_reward_entry(driver, entry, wait_seconds=random.randint(6, 10), tag=tag):
+            completed += 1
+            try:
+                gohome(driver)
+            except Exception:
+                pass
+    print(f"{tag} DOM 回退已触发 {completed}/{min(len(entries), 8)} 个任务")
+    return completed
+
+
+def _click_element(driver, element):
+    try:
+        element.click()
+        return
+    except Exception:
+        pass
+    driver.execute_script("arguments[0].click();", element)
+
+
+def _wait_for_activity_open(driver, previous_handles: set[str], previous_url: str, timeout: int = 10) -> str | None:
+    def _state(d):
+        handles = set(d.window_handles)
+        if len(handles) > len(previous_handles):
+            return "new_tab"
+        current_url = (getattr(d, "current_url", "") or "").strip()
+        if current_url and current_url != previous_url:
+            return "same_tab"
+        return None
+
+    try:
+        return WebDriverWait(driver, timeout).until(lambda d: _state(d))
+    except Exception:
+        return None
 
 
 def openDailySetActivity(driver, cardId: int):
     for attempt in range(3):
         try:
             previous_handles = set(driver.window_handles)
-            element = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable(
-                    (
-                        By.XPATH,
-                        f'//*[@id="daily-sets"]/mee-card-group[1]/div/mee-card[{cardId}]/div/card-content/mee-rewards-daily-set-item-content/div/a',
+            previous_url = (getattr(driver, "current_url", "") or "").strip()
+            links = WebDriverWait(driver, 10).until(lambda d: _collect_daily_set_links(d) or None)
+            if len(links) >= cardId:
+                element = links[cardId - 1]
+            else:
+                element = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable(
+                        (
+                            By.XPATH,
+                            f'//*[@id="daily-sets"]/mee-card-group[1]/div/mee-card[{cardId}]/div/card-content/mee-rewards-daily-set-item-content/div/a',
+                        )
                     )
                 )
-            )
-            element.click()
-            switchToNewTab(driver, 8, previous_handles=previous_handles)
-            closeCurrentTab(driver)
+            _click_element(driver, element)
+            open_state = _wait_for_activity_open(driver, previous_handles, previous_url, timeout=10)
+            if open_state == "new_tab":
+                switchToNewTab(driver, 8, previous_handles=previous_handles)
+                closeCurrentTab(driver)
+                return
+            if open_state == "same_tab":
+                time.sleep(8)
+                driver.back()
+                _wait_document_ready(driver, timeout=10)
+                return
+            raise RuntimeError("点击每日任务后未检测到新标签页或页面跳转")
             return
         except Exception as e:
             if attempt < 2:
@@ -939,7 +1976,7 @@ def closeCurrentTab(driver):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
 def goSearch(driver):
     try:
-        _safe_get(driver, "https://cn.bing.com/")
+        _open_first_available(driver, BING_HOME_URLS)
     except Exception as e:
         print(f"打开 Bing 失败：{e}")
         raise
@@ -1043,29 +2080,30 @@ def _infer_search_points(target_total: int) -> int:
     return 1
 
 
+def _remaining_searches_from_counter(counter_items: list[dict] | None) -> int:
+    if not counter_items:
+        return 0
+
+    remaining = 0
+    for item in counter_items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            progress = int(item.get("pointProgress", 0) or 0)
+            target = int(item.get("pointProgressMax", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if target <= 0:
+            continue
+        search_points = max(1, _infer_search_points(target))
+        remaining_points = max(0, target - progress)
+        remaining += math.ceil(remaining_points / search_points)
+    return remaining
+
+
 def getRemainingSearches(driver):
-    # dashboard = getDashboardData(driver)
-    # if not dashboard:
-    #     return 0, 0
-    # user_status = dashboard.get("userStatus", {})
-    # counters = user_status.get("counters", {})
-    # pcSearch = counters.get("pcSearch") or []
-    # remainingDesktop = 0
-    # if pcSearch:
-    #     progressDesktop = sum(item.get("pointProgress", 0) for item in pcSearch)
-    #     targetDesktop = sum(item.get("pointProgressMax", 0) for item in pcSearch)
-    #     search_points = _infer_search_points(targetDesktop)
-    #     remainingDesktop = max(0, int((targetDesktop - progressDesktop) / search_points))
-    #
-    # remainingMobile = 0
-    # level_info = user_status.get("levelInfo", {})
-    # mobileSearch = counters.get("mobileSearch") or []
-    # if level_info.get("activeLevel") != "Level1" and mobileSearch:
-    #     progressMobile = sum(item.get("pointProgress", 0) for item in mobileSearch)
-    #     targetMobile = sum(item.get("pointProgressMax", 0) for item in mobileSearch)
-    #     search_points = _infer_search_points(targetMobile)
-    #     remainingMobile = max(0, int((targetMobile - progressMobile) / search_points))
-    return random.randint(30,40), random.randint(30,40)
+    del driver
+    return DEFAULT_PC_SEARCHES, DEFAULT_MOBILE_SEARCHES
 
 
 def _ensure_keywords(*keyword_lists):
@@ -1098,7 +2136,7 @@ def _search_loop(driver, keyword_list, searches: int, tag: str, extra_sleep: boo
         print(f"{tag} 未获取到关键词，跳过搜索")
         return
     cycle = _keyword_cycle(keyword_list)
-    for _ in tqdm(range(int(searches/3)), desc=f"{tag} bing searches", unit="search"):
+    for _ in tqdm(range(searches), desc=f"{tag} bing searches", unit="search"):
         keyword = next(cycle)
         bing_search(driver, keyword)
         if extra_sleep:
@@ -1106,8 +2144,32 @@ def _search_loop(driver, keyword_list, searches: int, tag: str, extra_sleep: boo
         _maybe_take_break(tag)
 
 
+def _run_reward_promotions(driver, promotions: list[dict], tag: str):
+    pending = [item for item in promotions if _promotion_can_trigger(item)]
+    if not pending:
+        print(f"{tag} 无可触发任务")
+        return 0
+    completed = 0
+    for item in pending:
+        if _trigger_promotion(driver, item, wait_seconds=random.randint(6, 10), tag=tag):
+            completed += 1
+            _random_sleep(short_range=(1, 3))
+            try:
+                gohome(driver)
+            except Exception:
+                pass
+    print(f"{tag} 已触发 {completed}/{len(pending)} 个任务")
+    return completed
+
+
 def receive_points(driver):
     gohome(driver)
+    claimed_before = _claim_available_points(driver, tag="积分任务")
+    triggered = _run_dom_reward_fallback(driver, "积分任务")
+    gohome(driver)
+    claimed_after = _claim_available_points(driver, tag="积分任务")
+    total = claimed_before + triggered + claimed_after
+    print(f"本轮额外领取/触发任务共 {total} 个（领取 {claimed_before + claimed_after}，触发 {triggered}）")
 
 
 
@@ -1120,6 +2182,7 @@ def _run_desktop_flow(username: str, password: str, headless_flag: str | None) -
         time.sleep(random.randint(2, 4))
         daily_set(driver)
         remaining_desktop, remaining_mobile = getRemainingSearches(driver)
+        print(f"本轮计划搜索次数：PC={remaining_desktop}，移动端={remaining_mobile}")
         if remaining_desktop > 0:
             goSearch(driver)
             _ensure_bing_account(driver, username, tag="PC")
