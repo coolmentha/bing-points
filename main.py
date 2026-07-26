@@ -153,17 +153,32 @@ def do_login(page, username: str, password: str) -> bool:
     email_input.type(username, delay=80)
     page.wait_for_timeout(300)
 
-    next_btn = page.locator("#idSIButton9").first
-    if next_btn.count() == 0 or not next_btn.is_visible():
-        next_btn = page.locator("input[type='submit']").first
-    if next_btn.count() == 0 or not next_btn.is_visible():
-        next_btn = page.locator("button:has-text('下一步')").first
-    next_btn.click()
+    # 等待"下一步"按钮可用
+    page.wait_for_timeout(1500)
+    for btn_sel in [
+        "#idSIButton9",
+        "input[type='submit']",
+        "button[type='submit']",
+        "button:has-text('下一步')",
+        "input[value='下一步']",
+        "a:has-text('下一步')",
+        "[role='button']:has-text('下一步')",
+    ]:
+        next_btn = page.locator(btn_sel).first
+        if next_btn.count() > 0 and next_btn.is_visible() and next_btn.is_enabled():
+            next_btn.click()
+            print("  已点击下一步")
+            break
+    else:
+        # 回退：直接按回车
+        print("  ⚠ 未找到下一步按钮，尝试回车")
+        email_input.press("Enter")
     page.wait_for_timeout(3000)
 
     # 2. 等待密码页或安全验证页（循环处理）
     max_wait = 60
     waited = 0
+    pwd_filled = False  # 防止死循环：密码只填一次
     while waited < max_wait:
         url = page.url.lower()
 
@@ -174,19 +189,48 @@ def do_login(page, username: str, password: str) -> bool:
 
         # 密码输入框出现
         pwd = page.locator("input[name='passwd']").first
+        if pwd.count() == 0 or not pwd.is_visible():
+            pwd = page.locator("#i0118").first
+        if pwd.count() == 0 or not pwd.is_visible():
+            pwd = page.locator("input[type='password']").first
         if pwd.count() > 0 and pwd.is_visible():
+            if pwd_filled:
+                # 已填过密码，正在等待跳转，不再重复填写
+                page.wait_for_timeout(2000)
+                waited += 2
+                continue
             pwd.click()
             pwd.fill("")
             pwd.type(password, delay=80)
-            page.wait_for_timeout(200)
+            pwd_filled = True
+            # 等待"登录"按钮可用
+            page.wait_for_timeout(1500)
 
-            sign_btn = page.locator("#idSIButton9").first
-            if sign_btn.count() == 0 or not sign_btn.is_visible():
-                sign_btn = page.locator("input[type='submit']").first
-            if sign_btn.count() == 0 or not sign_btn.is_visible():
-                sign_btn = page.locator("button:has-text('登录')").first
-            if sign_btn.count() > 0:
-                sign_btn.click()
+            for btn_sel in [
+                "#idSIButton9",
+                "input[type='submit']",
+                "button[type='submit']",
+                "button:has-text('登录')",
+                "input[value='登录']",
+                "button:has-text('下一步')",
+                "[role='button']:has-text('登录')",
+            ]:
+                sign_btn = page.locator(btn_sel).first
+                if sign_btn.count() > 0 and sign_btn.is_visible() and sign_btn.is_enabled():
+                    sign_btn.click()
+                    print("  已点击登录")
+                    page.wait_for_timeout(3000)
+                    # 等待跳转
+                    try:
+                        page.wait_for_url(lambda u: "login.live.com" not in u.lower() and "login.microsoft" not in u.lower(), timeout=25000)
+                        break
+                    except Exception:
+                        pass
+                    break
+            else:
+                # 回退：按回车
+                print("  ⚠ 未找到登录按钮，尝试回车")
+                pwd.press("Enter")
                 page.wait_for_timeout(3000)
             continue
 
@@ -208,7 +252,7 @@ def do_login(page, username: str, password: str) -> bool:
         if use_pwd.count() > 0 and use_pwd.is_visible():
             use_pwd.click()
             page.wait_for_timeout(3000)
-            break
+            continue
 
         # 取消按钮
         cancel_btn = page.locator("#idBtn_Back").first
@@ -217,23 +261,42 @@ def do_login(page, username: str, password: str) -> bool:
             page.wait_for_timeout(2000)
             continue
 
+        # 保持登录弹窗：点"否"
+        for no_sel in [
+            "input[value='否']",
+            "#declineButton",
+            "button:has-text('否')",
+            "#idBtn_Back",
+        ]:
+            stay_no = page.locator(no_sel).first
+            if stay_no.count() > 0 and stay_no.is_visible():
+                stay_no.click()
+                print("  已点击'否'（保持登录弹窗）")
+                page.wait_for_timeout(2000)
+                break
+
         page.wait_for_timeout(2000)
         waited += 2
 
         if waited >= 30:
             print(f"  等待登录超时({waited}s)，当前URL: {page.url[:100]}")
 
-    # 3. 保持登录：点"否"
-    page.wait_for_timeout(3000)
-    try:
-        no_btn = page.locator("input[value='否']").first
-        if no_btn.count() == 0:
-            no_btn = page.locator("#idBtn_Back").first
-        if no_btn.count() > 0 and no_btn.is_visible():
-            no_btn.click()
-            page.wait_for_timeout(2000)
-    except Exception:
-        pass
+    # 3. 兜底处理保持登录弹窗
+    page.wait_for_timeout(2000)
+    for no_sel in [
+        "input[value='否']",
+        "#declineButton",
+        "button:has-text('否')",
+        "#idBtn_Back",
+    ]:
+        try:
+            no_btn = page.locator(no_sel).first
+            if no_btn.count() > 0 and no_btn.is_visible():
+                no_btn.click()
+                page.wait_for_timeout(2000)
+                break
+        except Exception:
+            continue
 
     # 等待最终跳转
     try:
@@ -241,7 +304,11 @@ def do_login(page, username: str, password: str) -> bool:
     except Exception:
         pass
 
-    print(f"  登录后URL: {page.url[:100]}")
+    url_now = page.url.lower()
+    print(f"  登录后URL: {url_now[:100]}")
+    if "login.live.com" in url_now or "login.microsoft" in url_now:
+        print("  ✗ 登录未成功，仍在登录页面（可能需要验证码/2FA/密码错误）")
+        return False
     return True
 
 
@@ -457,8 +524,167 @@ def claim_available_points(page) -> int:
     return 0
 
 
+def _handle_activity_page(page) -> bool:
+    """处理测验/投票/探索类活动页面 — 返回是否成功交互"""
+    page.wait_for_timeout(3000)
+
+    interacted = False
+
+    # 测验类: 循环答题(最多12题)
+    for q_idx in range(12):
+        answered = False
+
+        # 尝试点击答案选项
+        for ans_sel in [
+            ".rq_answer",
+            "[data-isOption='true']",
+            ".btOption",
+            ".quiz-option",
+            ".answer-option",
+            "button.answer-btn",
+            "div.rq_answers > div",
+            "[role='radio']",
+            "label[role='radio']",
+            ".option-card",
+            ".choice-option",
+            "input[type='radio']",
+            ".poll-option",
+            "button:has-text('投票')",
+        ]:
+            try:
+                options = page.locator(ans_sel)
+                count = options.count()
+                if count > 0:
+                    # 优先点第一个可见的
+                    for i in range(count):
+                        opt = options.nth(i)
+                        if opt.is_visible():
+                            opt.click(delay=random.randint(100, 300))
+                            page.wait_for_timeout(random.randint(1200, 2200))
+                            answered = True
+                            interacted = True
+                            break
+                    if answered:
+                        break
+            except Exception:
+                continue
+
+        if not answered:
+            # 尝试点击任意可点击的答案区域
+            try:
+                answer_zone = page.locator(".rq_answers, .bt_poll, .quiz-content, [data-testid='quiz-body']")
+                if answer_zone.count() > 0:
+                    clickable = answer_zone.first.locator("a, button, [role='button'], [tabindex]")
+                    if clickable.count() > 0:
+                        clickable.first.click()
+                        page.wait_for_timeout(random.randint(1500, 2500))
+                        interacted = True
+            except Exception:
+                pass
+
+        # 尝试点"下一题"/"Next"按钮
+        for next_sel in [
+            ".rq_nextBtn",
+            "#nextQuestionbtn",
+            "button:has-text('Next')",
+            "button:has-text('下一题')",
+            "a:has-text('Next')",
+            "a:has-text('下一题')",
+            ".nextQuestion",
+            "[data-testid='next-button']",
+        ]:
+            try:
+                next_btn = page.locator(next_sel).first
+                if next_btn.count() > 0 and next_btn.is_visible():
+                    next_btn.click()
+                    page.wait_for_timeout(random.randint(1500, 3000))
+                    interacted = True
+                    break
+            except Exception:
+                continue
+
+        # 没有可交互的元素了，可能已结束
+        if not answered:
+            break
+
+    # 尝试点"完成"/"关闭"/"Done"
+    for done_sel in [
+        "button:has-text('Done')",
+        "button:has-text('完成')",
+        "button:has-text('关闭')",
+        ".rq_closeBtn",
+        ".rq_doneBtn",
+        "[aria-label='Close']",
+        "[aria-label='关闭']",
+        ".close-button",
+        "#closeButton",
+        "a:has-text('完成')",
+    ]:
+        try:
+            done_btn = page.locator(done_sel).first
+            if done_btn.count() > 0 and done_btn.is_visible():
+                done_btn.click()
+                page.wait_for_timeout(2000)
+                interacted = True
+                break
+        except Exception:
+            continue
+
+    page.wait_for_timeout(2000)
+    return interacted
+
+
+def _find_and_click_daily_card(page, item: dict) -> bool:
+    """在仪表板上查找并点击每日套餐活动卡片，返回是否成功点击"""
+    title = item.get("title", "")
+    offer_id = item.get("offerId", "")
+    destination = item.get("destination", "")
+
+    # 策略1: 通过标题文本匹配卡片
+    if title:
+        for t in [title, title[:15], title.split(" ")[0]]:
+            try:
+                el = page.locator(f"text='{t}'").first
+                if el.count() > 0 and el.is_visible():
+                    # 往上找可点击的父元素
+                    clickable = el.locator("xpath=ancestor::a | ancestor::button | ancestor::*[@role='button']").first
+                    if clickable.count() > 0:
+                        clickable.click(delay=random.randint(50, 200))
+                        return True
+            except Exception:
+                continue
+
+    # 策略2: 通过 offerId 匹配
+    if offer_id:
+        for sel in [
+            f"[data-offer-id='{offer_id}']",
+            f"[data-offerid='{offer_id}']",
+        ]:
+            try:
+                el = page.locator(sel).first
+                if el.count() > 0 and el.is_visible():
+                    el.click(delay=random.randint(50, 200))
+                    return True
+            except Exception:
+                continue
+
+    # 策略3: 通过 destination URL 匹配
+    if destination:
+        url_part = destination.strip("/").split("/")[-1][:30]
+        if url_part:
+            try:
+                el = page.locator(f"a[href*='{url_part}']").first
+                if el.count() > 0 and el.is_visible():
+                    el.click(delay=random.randint(50, 200))
+                    return True
+            except Exception:
+                pass
+
+    return False
+
+
 def do_daily_set_tasks(page, daily_items: list[dict]) -> int:
-    """执行每日任务"""
+    """执行每日任务 — 点击仪表板卡片"""
     if not daily_items:
         print("  未找到每日任务")
         return 0
@@ -473,33 +699,138 @@ def do_daily_set_tasks(page, daily_items: list[dict]) -> int:
 
         print(f"  [{idx+1}/{len(daily_items)}] {title} (+{points})")
 
-        if destination:
-            # 新标签打开任务URL
-            try:
-                with page.context.expect_page() as new_page_info:
-                    page.evaluate("(url) => window.open(url, '_blank')", destination)
-                new_page = new_page_info.value
-                new_page.wait_for_load_state("domcontentloaded", timeout=15000)
-                random_sleep(short_range=(4, 8))
-                new_page.close()
-                completed += 1
-                print(f"    完成")
-            except Exception as e:
-                print(f"    失败: {e}")
-                # 回退：本页跳转
-                try:
-                    safe_goto(page, destination)
-                    random_sleep(short_range=(4, 8))
-                    safe_goto(page, REWARDS_DASHBOARD)
-                except Exception:
-                    safe_goto(page, REWARDS_DASHBOARD)
-        else:
+        if not destination:
             print(f"    无目标URL，跳过")
+            continue
 
+        url_before = page.url
+
+        if not _find_and_click_daily_card(page, item):
+            print(f"    未找到对应卡片")
+            continue
+
+        page.wait_for_timeout(2500)
+        try:
+            if len(page.context.pages) > 1:
+                new_page = page.context.pages[-1]
+                if new_page != page:
+                    new_page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    _handle_activity_page(new_page)
+                    new_page.close()
+                    completed += 1
+                    print(f"    完成 (新标签)")
+            elif page.url != url_before and "rewards.bing.com/dashboard" not in page.url:
+                _handle_activity_page(page)
+                completed += 1
+                print(f"    完成 (导航)")
+            else:
+                _handle_activity_page(page)
+                completed += 1
+                print(f"    完成 (弹窗)")
+        except Exception as e:
+            print(f"    处理失败: {e}")
+
+        safe_goto(page, REWARDS_DASHBOARD, wait_extra=2000)
         random_sleep(short_range=(1, 3))
 
-    # 回到dashboard
-    safe_goto(page, REWARDS_DASHBOARD)
+    return completed
+
+
+def do_dashboard_activities(page) -> int:
+    """处理仪表板上的每日活动卡片（需点击卡片才能完成）"""
+    print("  扫描仪表板活动卡片...")
+    completed = 0
+    clicked_urls: set[str] = set()
+
+    # 按优先级排列: 越具体的放前面
+    activity_selectors = [
+        "a[href*='/rewards/daily']",
+        "[data-testid='activity-card'] a, [data-testid='activity-card'] button",
+        "a[href*='/rewards/quiz']",
+        "a[href*='/rewards/poll']",
+        "a[href*='/rewards/explore']",
+        "a[href*='/rewards/earn']",
+        "button:has-text('赚取积分')",
+        "a:has-text('赚取积分')",
+        "a:has-text('了解详情')",
+        "[aria-label*='积分']:not([aria-label*='搜索'])",
+    ]
+
+    # 先排除已完成/已领取的元素
+    completed_indicators = [
+        "已完成", "已领取", "Completed",
+        "[aria-label*='done']", "[aria-label*='complete']",
+        "svg[class*='check']", ".completed",
+    ]
+
+    def _looks_completed(el) -> bool:
+        try:
+            parent_html = el.locator("xpath=ancestor::*[1]").inner_html()
+            for indicator in completed_indicators:
+                if indicator.lower() in parent_html.lower():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    for sel in activity_selectors:
+        try:
+            entries = page.locator(sel)
+            count = entries.count()
+            for i in range(count):
+                entry = entries.nth(i)
+                if not entry.is_visible():
+                    continue
+                if _looks_completed(entry):
+                    continue
+
+                href = ""
+                try:
+                    href = entry.get_attribute("href") or ""
+                except Exception:
+                    pass
+                if href and href in clicked_urls:
+                    continue
+                if href:
+                    clicked_urls.add(href)
+
+                url_before = page.url
+                try:
+                    entry.click(delay=random.randint(50, 200))
+                    page.wait_for_timeout(random.randint(2500, 4000))
+                except Exception:
+                    continue
+
+                # 处理点击后的结果
+                try:
+                    if len(page.context.pages) > 1:
+                        new_page = page.context.pages[-1]
+                        if new_page != page:
+                            new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+                            _handle_activity_page(new_page)
+                            new_page.close()
+                            completed += 1
+                            print(f"    活动完成 (新标签)")
+                    elif page.url != url_before and "rewards.bing.com/dashboard" not in page.url:
+                        _handle_activity_page(page)
+                        completed += 1
+                        print(f"    活动完成: {page.url[:80]}")
+                    else:
+                        _handle_activity_page(page)
+                        completed += 1
+                        print(f"    活动完成 (弹窗)")
+                except Exception as e:
+                    print(f"    活动处理异常: {e}")
+
+                safe_goto(page, REWARDS_DASHBOARD, wait_extra=2000)
+                page.wait_for_timeout(1500)
+        except Exception:
+            continue
+
+    if completed == 0:
+        print("  未找到未完成的仪表板活动卡片")
+    else:
+        print(f"  完成 {completed} 个仪表板活动")
     return completed
 
 
@@ -641,11 +972,17 @@ def run_account(context, username: str, password: str, headless: bool):
         # 再次确认不在登录页
         url = page.url.lower()
         if "login" in url or "welcome" in url:
-            print("  仍需登录...")
+            print("  仍未登录，再次尝试...")
             if not do_login(page, username, password):
                 print("  登录失败，跳过")
                 return
             safe_goto(page, REWARDS_DASHBOARD, wait_extra=5000)
+
+        # 最终确认登录状态
+        url = page.url.lower()
+        if "login" in url or "welcome" in url:
+            print("  登录未成功，可能需人工验证（2FA/验证码/密码错误），跳过")
+            return
 
         # 3. 解析页面数据
         print("  解析页面数据...")
@@ -659,15 +996,29 @@ def run_account(context, username: str, password: str, headless: bool):
         claim_available_points(page)
         safe_goto(page, REWARDS_DASHBOARD)
 
-        # 5. 每日任务
+        # 5. 每日任务(每日套餐: 测验/投票/探索)
         print("\n  --- 每日任务 ---")
         do_daily_set_tasks(page, data["daily_set_items"])
 
-        # 6. 领取完成后的积分
+        # 6. 仪表板活动卡片(每日活动)
+        print("\n  --- 每日活动 ---")
+        do_dashboard_activities(page)
+        safe_goto(page, REWARDS_DASHBOARD)
+
+        # 7. 领取完成后的积分
         claim_available_points(page)
         safe_goto(page, REWARDS_DASHBOARD)
 
-        # 7. PC 搜索
+        # 8. 验证活动完成情况
+        print("  验证完成情况...")
+        data2 = parse_dashboard_data(page)
+        daily_done = data2.get("daily_activities_done", 0)
+        daily_total = data2.get("daily_activities_total", 3)
+        print(f"    活动进度: {daily_done}/{daily_total}")
+        if data2["daily_set_items"]:
+            print(f"    剩余每日任务: {len(data2['daily_set_items'])} 个")
+
+        # 9. PC 搜索
         pc_needed = max(0, data["pc_search_total"] - data["pc_search_done"])
         if pc_needed > 0:
             print(f"\n  --- PC 搜索 ({pc_needed}次) ---")
@@ -676,11 +1027,11 @@ def run_account(context, username: str, password: str, headless: bool):
         else:
             print("\n  PC 搜索已完成，跳过")
 
-        # 8. 搜索后再领取
+        # 10. 搜索后再领取
         safe_goto(page, REWARDS_DASHBOARD)
         claim_available_points(page)
 
-        # 9. 移动端搜索
+        # 11. 移动端搜索
         mobile_needed = max(0, data.get("mobile_search_total", DEFAULT_MOBILE_SEARCHES) - data.get("mobile_search_done", 0))
         if mobile_needed > 0:
             print(f"\n  --- 移动端搜索 ({mobile_needed}次) ---")
@@ -695,7 +1046,7 @@ def run_account(context, username: str, password: str, headless: bool):
             finally:
                 mobile_page.close()
 
-        # 10. 最终领取
+        # 12. 最终领取
         safe_goto(page, REWARDS_DASHBOARD)
         claim_available_points(page)
 
