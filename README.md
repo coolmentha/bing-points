@@ -7,7 +7,7 @@
 - 自动触发 Rewards 面板中的每日任务、Punch Card、额外积分任务，补上“打开面板但未真正领取/触发”的缺口。
 - 支持多账号轮询登录；如已处于正确登录态将直接复用，否则自动注销后登录。
 - 自动下载/定位 Edge WebDriver，默认优先本地 `msedgedriver.exe`。
-- 搜索次数改为配置驱动：默认桌面 30 次、移动 20 次，可用环境变量覆盖，不再依赖 Rewards 页面内部状态。
+- 搜索次数改为配置驱动：默认桌面 37 次、移动 0 次（新版 Rewards 移动端积分需手机 App，浏览器刷搜索不计分），可用环境变量覆盖。
 - 兼容新版入口：Rewards 面板与 Bing 搜索页都会按候选地址自动回退，减少因域名/入口切换导致的失败。
 
 ## 使用步骤
@@ -20,8 +20,8 @@
    ```
 3. 可选：将 Edge 驱动放在项目根目录命名为 `msedgedriver.exe`，或设置环境变量 `EDGEWEBDRIVER` 指向驱动路径。
 4. 可选：如需修改搜索次数，可设置：
-   - `BING_REWARDS_PC_SEARCHES=30`
-   - `BING_REWARDS_MOBILE_SEARCHES=20`
+   - `BING_REWARDS_PC_SEARCHES=37`
+   - `BING_REWARDS_MOBILE_SEARCHES=0`（设为 0 跳过移动端搜索）
 5. 运行脚本：`python main.py`（Linux/macOS 建议用 `python3 main.py`）
    - 无头模式：`python main.py headless`（也支持 `--headless` / `-h`）
    - 其他参数会被忽略并提示（避免误传参数导致无头）
