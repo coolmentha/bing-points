@@ -1,3 +1,6 @@
 accounts.txt
 .idea
 .codex
+__pycache__/
+tests/__pycache__/
+tmp_playwright_profile/
