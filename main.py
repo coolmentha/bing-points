@@ -10,7 +10,7 @@ from playwright.sync_api import sync_playwright
 
 from utils.accounts import load_accounts
 from utils.browser import do_searches, safe_goto
-from utils.config import BING_HOME, DEFAULT_MOBILE_SEARCHES, REWARDS_DASHBOARD, USER_DATA_DIR
+from utils.config import BING_HOME, DEFAULT_MOBILE_SEARCHES, DEFAULT_PC_SEARCHES, REWARDS_DASHBOARD, USER_DATA_DIR
 from utils.dashboard import parse_dashboard_data
 from utils.login import do_login
 from utils.tasks import (
@@ -23,6 +23,17 @@ from utils.trends import ensure_keywords, get_baidu_trends, get_zhihu_trends, ge
 
 
 # ======================== 主流程 ========================
+
+def make_pc_score(page):
+    """读取积分余额的回调，供 do_searches 校验搜索是否继续计分"""
+    def _score():
+        try:
+            safe_goto(page, REWARDS_DASHBOARD, wait_extra=2000)
+            return parse_dashboard_data(page).get("total_points")
+        except Exception:
+            return None
+    return _score
+
 
 def run_account(context, username: str, password: str, headless: bool):
     """处理单个账号的完整流程"""
@@ -122,14 +133,14 @@ def run_account(context, username: str, password: str, headless: bool):
         if data2["daily_set_items"]:
             print(f"    剩余每日任务: {len(data2['daily_set_items'])} 个")
 
-        # 9. PC 搜索
-        pc_needed = max(0, data["pc_search_total"] - data["pc_search_done"])
-        if pc_needed > 0:
-            print(f"\n  --- PC 搜索 ({pc_needed}次) ---")
+        # 9. PC 搜索 — 面板无今日搜索计数（"搜索: 1/1"是打卡子任务），
+        #    按每日上限次数执行（3分/次×20=60分），积分余额不增长则提前结束
+        if DEFAULT_PC_SEARCHES > 0:
+            print(f"\n  --- PC 搜索 (计划{DEFAULT_PC_SEARCHES}次) ---")
             keywords = ensure_keywords(get_baidu_trends(), get_zhihu_trends(), get_weibo_trends())
-            do_searches(page, pc_needed, keywords, "PC")
+            do_searches(page, DEFAULT_PC_SEARCHES, keywords, "PC", verify=make_pc_score(page))
         else:
-            print("\n  PC 搜索已完成，跳过")
+            print("\n  PC 搜索已跳过")
 
         # 10. 搜索后再领取
         safe_goto(page, REWARDS_DASHBOARD)

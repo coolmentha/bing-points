@@ -133,18 +133,25 @@ def test_parse_dashboard_data_full():
         ']'
         '"pointClaim":{"points":183,"entries":[{"id":1}]}'
     )
-    body = "搜索: 5/37 移动搜索: 2/20 活动: 1/3"
+    body = "可用积分\n\n3,782\n活动: 1/3"
     data = dashboard.parse_dashboard_data(FakePage(html, body))
 
     assert data["claimable_points"] == 183
     assert data["claim_entries"] == [{"id": 1}]
     assert [item["title"] for item in data["daily_set_items"]] == ["任务A"]
-    assert data["pc_search_done"] == 5
-    assert data["pc_search_total"] == 37
-    assert data["mobile_search_done"] == 2
-    assert data["mobile_search_total"] == 20
+    assert data["total_points"] == 3782
+    # 面板无今日搜索计数，一律用默认值
+    assert data["pc_search_done"] == 0
+    assert data["pc_search_total"] == config.DEFAULT_PC_SEARCHES
     assert data["daily_activities_done"] == 1
     assert data["daily_activities_total"] == 3
+
+
+def test_parse_dashboard_data_ignores_streak_search_counter():
+    """打卡子任务"搜索: 1/1"不能被当成今日搜索进度"""
+    data = dashboard.parse_dashboard_data(FakePage("<html></html>", "搜索: 1/1\n活动: 3/3"))
+    assert data["pc_search_done"] == 0
+    assert data["pc_search_total"] == config.DEFAULT_PC_SEARCHES
 
 
 def test_parse_dashboard_data_fallback_latest_date():
@@ -162,6 +169,7 @@ def test_parse_dashboard_data_defaults_without_data():
     data = dashboard.parse_dashboard_data(FakePage("<html></html>"))
     assert data["claimable_points"] == 0
     assert data["daily_set_items"] == []
+    assert data["total_points"] == 0
     assert data["pc_search_total"] == config.DEFAULT_PC_SEARCHES
     assert data["pc_search_done"] == 0
 
@@ -200,6 +208,33 @@ def test_do_searches_runs_requested_count(monkeypatch):
     monkeypatch.setattr(browser.time, "sleep", lambda *_: None)
     browser.do_searches(object(), 3, ["a", "b"], "PC")
     assert called["n"] == 3
+
+
+def test_do_searches_stops_when_score_stalls(monkeypatch):
+    """积分余额连续2次核对无增长 → 提前结束（每4次核对一次）"""
+    called = {"n": 0}
+    monkeypatch.setattr(browser, "do_bing_search", lambda *_: called.__setitem__("n", called["n"] + 1))
+    monkeypatch.setattr(browser.time, "sleep", lambda *_: None)
+    browser.do_searches(object(), 20, ["a", "b"], "PC", verify=lambda: 100)
+    assert called["n"] == 8  # 基线1次 + 第4、8次核对，连续2次无增长 → 第8次后停
+
+
+def test_do_searches_continues_while_score_grows(monkeypatch):
+    called = {"n": 0}
+    monkeypatch.setattr(browser, "do_bing_search", lambda *_: called.__setitem__("n", called["n"] + 1))
+    monkeypatch.setattr(browser.time, "sleep", lambda *_: None)
+    scores = iter([100, 112, 124, 136, 148, 160])
+    browser.do_searches(object(), 20, ["a", "b"], "PC", verify=lambda: next(scores))
+    assert called["n"] == 20
+
+
+def test_do_searches_full_count_when_score_unreadable(monkeypatch):
+    """余额解析失败(None/0)不触发提前停止，跑满计划次数"""
+    called = {"n": 0}
+    monkeypatch.setattr(browser, "do_bing_search", lambda *_: called.__setitem__("n", called["n"] + 1))
+    monkeypatch.setattr(browser.time, "sleep", lambda *_: None)
+    browser.do_searches(object(), 6, ["a", "b"], "PC", verify=lambda: None)
+    assert called["n"] == 6
 
 
 # ======================== 领取积分 ========================

@@ -77,8 +77,12 @@ def _random_click_result(page):
         pass
 
 
-def do_searches(page, count: int, keywords: list, tag: str):
-    """执行批量搜索"""
+def do_searches(page, count: int, keywords: list, tag: str, verify=None):
+    """执行批量搜索
+
+    verify: 可选回调，返回当前积分余额。每4次搜索核对一次，
+    连续2次无增长（已达封顶或未计分）则提前结束。
+    """
     if count <= 0:
         print(f"  {tag} 无需搜索")
         return
@@ -90,9 +94,26 @@ def do_searches(page, count: int, keywords: list, tag: str):
     print(f"  {tag} 搜索: {count} 次")
     cycle = _keyword_cycle(keywords)
 
+    prev_score = verify() if verify else None
+    if prev_score:
+        print(f"    当前积分: {prev_score}")
+    stable_checks = 0
+
     for i in range(count):
         keyword = next(cycle)
         do_bing_search(page, keyword)
+        if verify and (i + 1) % 4 == 0:
+            score = verify()
+            if score and prev_score and score == prev_score:
+                stable_checks += 1
+                print(f"    积分无增长({score})，连续 {stable_checks} 次")
+                if stable_checks >= 2:
+                    print(f"  {tag} 积分已达上限，提前结束（实际执行 {i + 1} 次）")
+                    return
+            else:
+                stable_checks = 0
+            if score:
+                prev_score = score
         if i < count - 1:
             delay = random.randint(15, 60)
             if i % 5 == 0 and i > 0:

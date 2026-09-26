@@ -10,7 +10,8 @@ ACCOUNTS_PATH = _PROJECT_ROOT / "accounts.txt"
 REQUEST_TIMEOUT = 8
 TRENDS_CACHE_FAILURE_TTL = 600
 
-DEFAULT_PC_SEARCHES = int(os.getenv("BING_REWARDS_PC_SEARCHES", "37"))
+# PC 搜索：每次 3 分，60 分/天封顶 ≈ 20 次（面板无今日计数，按计划次数执行 + 积分校验兜底）
+DEFAULT_PC_SEARCHES = int(os.getenv("BING_REWARDS_PC_SEARCHES", "20"))
 DEFAULT_MOBILE_SEARCHES = int(os.getenv("BING_REWARDS_MOBILE_SEARCHES", "0"))
 
 REWARDS_DASHBOARD = "https://rewards.bing.com/dashboard"

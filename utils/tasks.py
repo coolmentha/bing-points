@@ -147,7 +147,7 @@ def _handle_activity_page(page) -> bool:
         if not answered:
             break
 
-    # 尝试点"完成"/"关闭"/"Done"
+    # 尝试点"完成"/"关闭"/"Done"；拼图类活动无需作答，点"跳过"即可拿分
     for done_sel in [
         "button:has-text('Done')",
         "button:has-text('完成')",
@@ -159,6 +159,10 @@ def _handle_activity_page(page) -> bool:
         ".close-button",
         "#closeButton",
         "a:has-text('完成')",
+        "button:has-text('跳过')",
+        "a:has-text('跳过')",
+        "[aria-label='跳过']",
+        "[role='button']:has-text('跳过')",
     ]:
         try:
             done_btn = page.locator(done_sel).first
@@ -166,6 +170,22 @@ def _handle_activity_page(page) -> bool:
                 done_btn.click()
                 page.wait_for_timeout(2000)
                 interacted = True
+                if "跳过" in done_sel:
+                    # 点跳过后可能弹确认框
+                    for confirm_sel in [
+                        "[role='dialog'] button:has-text('跳过')",
+                        "button:has-text('确认跳过')",
+                        "[role='dialog'] button:has-text('确认')",
+                        "[role='dialog'] button:has-text('确定')",
+                    ]:
+                        try:
+                            confirm_btn = page.locator(confirm_sel).first
+                            if confirm_btn.count() > 0 and confirm_btn.is_visible():
+                                confirm_btn.click()
+                                page.wait_for_timeout(2000)
+                                break
+                        except Exception:
+                            continue
                 break
         except Exception:
             continue
@@ -396,6 +416,9 @@ def extract_daily_earn_links(panel_html: str) -> list[dict]:
             continue
         if "已完成" in block or "Completed" in block:
             continue
+        # 仅限积分商城/应用内完成的任务，网页端做不了，直接跳过
+        if "积分商城" in block or "仅限" in block:
+            continue
         # 只做搜索类任务：带追踪参数的 bing 搜索链接
         if "bing.com/search" not in href:
             continue
@@ -404,6 +427,15 @@ def extract_daily_earn_links(panel_html: str) -> list[dict]:
         seen.add(href)
         items.append({"title": title, "url": href})
     return items
+
+
+def _is_app_only_page(pg) -> bool:
+    """判断页面是否提示仅限积分商城应用完成（网页端做不了）"""
+    try:
+        html = pg.content()
+    except Exception:
+        return False
+    return "积分商城" in html or ("仅限" in html and "应用" in html)
 
 
 def do_daily_earn_tasks(page) -> int:
@@ -439,11 +471,20 @@ def do_daily_earn_tasks(page) -> int:
 
             if new_page is not None and new_page != page:
                 new_page.wait_for_load_state("domcontentloaded", timeout=15000)
+                if _is_app_only_page(new_page):
+                    print("    仅限积分商城应用完成，跳过")
+                    new_page.close()
+                    random_sleep(short_range=(1, 3))
+                    continue
                 page.wait_for_timeout(random.randint(3000, 5000))
                 _random_scroll(new_page)
                 new_page.close()
             else:
                 # 未开新标签：可能同页跳转或弹窗，稍作停留
+                if _is_app_only_page(page):
+                    print("    仅限积分商城应用完成，跳过")
+                    random_sleep(short_range=(1, 3))
+                    continue
                 page.wait_for_timeout(random.randint(3000, 5000))
                 _random_scroll(page)
             completed += 1

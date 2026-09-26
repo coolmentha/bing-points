@@ -53,6 +53,7 @@ def parse_dashboard_data(page) -> dict:
         "claimable_points": 0,
         "claim_entries": [],
         "daily_set_items": [],
+        "total_points": 0,
         "pc_search_total": DEFAULT_PC_SEARCHES,
         "pc_search_done": 0,
         "mobile_search_total": DEFAULT_MOBILE_SEARCHES,
@@ -119,20 +120,11 @@ def parse_dashboard_data(page) -> dict:
     # 从页面文本提取进度
     body_text = page.evaluate("() => document.body.innerText || ''")
 
-    for pattern in [
-        r'必应搜索[:\s]*(\d+)\s*/\s*(\d+)',
-        r'搜索[:\s]*(\d+)\s*/\s*(\d+)',
-    ]:
-        m = re.search(pattern, body_text)
-        if m:
-            result["pc_search_done"] = int(m.group(1))
-            result["pc_search_total"] = int(m.group(2))
-            break
-
-    mobile_match = re.search(r'移动搜索[:\s]*(\d+)\s*/\s*(\d+)', body_text)
-    if mobile_match:
-        result["mobile_search_done"] = int(mobile_match.group(1))
-        result["mobile_search_total"] = int(mobile_match.group(2))
+    # 注意: 面板上没有"今日搜索次数"计数（"搜索: 1/1"是每日连续打卡的子任务，
+    # 不能当作搜索进度），PC/移动搜索按计划次数执行，由积分余额校验兜底
+    m = re.search(r'可用积分\s*\n\s*([\d,]+)', body_text)
+    if m:
+        result["total_points"] = int(m.group(1).replace(",", ""))
 
     daily_match = re.search(r'活动[:\s]*(\d+)\s*/\s*(\d+)', body_text)
     if daily_match:
