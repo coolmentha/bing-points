@@ -9,3 +9,5 @@ tmp_playwright_temp/
 logs/
 # 失败推送的 SMTP 凭据：只提交 .env.example
 .env
+
+pytest-of-*/
