@@ -1,4 +1,6 @@
 """Rewards 任务执行：领积分 / 每日任务 / 每日活动 / 日常任务"""
+import heapq
+import html as html_lib
 import random
 import re
 
@@ -6,8 +8,79 @@ from utils.browser import _random_scroll, random_sleep, safe_goto
 from utils.config import REWARDS_DASHBOARD, REWARDS_EARN_PAGE
 
 
+MICROSOFT_HOSTS = (
+    "bing.com", "microsoft.com", "live.com", "microsoftonline.com",
+)
+
+# 微软验证页的精确端点；不使用正文关键词或通用 captcha DOM，避免误报。
+RISK_CONTROL_PATHS = (
+    "/challenge", "/captcha", "/auth/challenge", "/login/challenge",
+)
+
+
+class RewardsRiskControlError(RuntimeError):
+    """页面出现微软验证码或限制页时立即停止当前账号。"""
+
+
+class RiskDetectionError(RuntimeError):
+    """风控检测过程中页面不可访问；仅供底层判断是否继续，不能直接判风控。"""
+
+
+def detect_risk_control(page) -> str | None:
+    return detect_microsoft_risk(page)
+
+
+def _is_microsoft_url(url: str) -> bool:
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url or "").hostname or "").lower()
+    except Exception:
+        return False
+    return any(host == item or host.endswith("." + item) for item in MICROSOFT_HOSTS)
+
+
+def _url_is_verification(url: str) -> bool:
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url or "")
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower().rstrip("/")
+    except Exception:
+        return False
+    if not any(host == item or host.endswith("." + item) for item in MICROSOFT_HOSTS):
+        return False
+    return path in RISK_CONTROL_PATHS
+
+
+def _page_risk_evidence(page):
+    """读取页面标题仅用于日志；读取失败时返回空字符串，不应升级成风控。"""
+    try:
+        value = page.evaluate("() => document.title || ''")
+        return value if isinstance(value, str) else ""
+    except Exception:
+        return ""
+
+
+def detect_microsoft_risk(page) -> str | None:
+    """只识别微软验证网页；普通搜索、第三方 captcha 和正文关键词不触发。"""
+    try:
+        url = page.url or ""
+    except Exception:
+        return None
+    if not _is_microsoft_url(url) or not _url_is_verification(url):
+        return None
+    title = (_page_risk_evidence(page) or "").strip()[:120]
+    return f"微软验证页面; url={url[:200]}; title={title}"
+
+def _ensure_no_risk_control(page) -> None:
+    reason = detect_risk_control(page)
+    if reason:
+        raise RewardsRiskControlError(reason)
+
+
 def claim_available_points(page) -> int:
     """点击"可领取→领取"按钮（两段式：打开弹窗 → 确认领取）"""
+    _ensure_no_risk_control(page)
     print("  检查可领取积分...")
 
     # 步骤1: 点击"可领取"卡片打开弹窗
@@ -23,8 +96,12 @@ def claim_available_points(page) -> int:
                 page.wait_for_timeout(2000)
                 opened_dialog = True
                 break
+        except (RewardsRiskControlError, RiskDetectionError):
+            raise
         except Exception:
             continue
+        finally:
+            _ensure_no_risk_control(page)
 
     if not opened_dialog:
         print("  未找到可领取按钮")
@@ -48,6 +125,7 @@ def claim_available_points(page) -> int:
                 page.wait_for_timeout(1000)
                 return 0
             claim_btn.click()
+            _ensure_no_risk_control(page)
             print("  已点击弹窗内领取积分")
             page.wait_for_timeout(3000)
             # 等待弹窗关闭
@@ -58,6 +136,8 @@ def claim_available_points(page) -> int:
             return 1
 
         print("  弹窗内未找到领取按钮")
+    except (RewardsRiskControlError, RiskDetectionError):
+        raise
     except Exception as e:
         print(f"  处理弹窗失败: {e}")
 
@@ -66,7 +146,9 @@ def claim_available_points(page) -> int:
 
 def _handle_activity_page(page) -> bool:
     """处理测验/投票/探索类活动页面 — 返回是否成功交互"""
+    _ensure_no_risk_control(page)
     page.wait_for_timeout(3000)
+    _ensure_no_risk_control(page)
 
     interacted = False
 
@@ -101,11 +183,14 @@ def _handle_activity_page(page) -> bool:
                         if opt.is_visible():
                             opt.click(delay=random.randint(100, 300))
                             page.wait_for_timeout(random.randint(1200, 2200))
+                            _ensure_no_risk_control(page)
                             answered = True
                             interacted = True
                             break
                     if answered:
                         break
+            except (RewardsRiskControlError, RiskDetectionError):
+                raise
             except Exception:
                 continue
 
@@ -118,7 +203,10 @@ def _handle_activity_page(page) -> bool:
                     if clickable.count() > 0:
                         clickable.first.click()
                         page.wait_for_timeout(random.randint(1500, 2500))
+                        _ensure_no_risk_control(page)
                         interacted = True
+            except (RewardsRiskControlError, RiskDetectionError):
+                raise
             except Exception:
                 pass
 
@@ -138,8 +226,11 @@ def _handle_activity_page(page) -> bool:
                 if next_btn.count() > 0 and next_btn.is_visible():
                     next_btn.click()
                     page.wait_for_timeout(random.randint(1500, 3000))
+                    _ensure_no_risk_control(page)
                     interacted = True
                     break
+            except (RewardsRiskControlError, RiskDetectionError):
+                raise
             except Exception:
                 continue
 
@@ -169,6 +260,7 @@ def _handle_activity_page(page) -> bool:
             if done_btn.count() > 0 and done_btn.is_visible():
                 done_btn.click()
                 page.wait_for_timeout(2000)
+                _ensure_no_risk_control(page)
                 interacted = True
                 if "跳过" in done_sel:
                     # 点跳过后可能弹确认框
@@ -183,10 +275,15 @@ def _handle_activity_page(page) -> bool:
                             if confirm_btn.count() > 0 and confirm_btn.is_visible():
                                 confirm_btn.click()
                                 page.wait_for_timeout(2000)
+                                _ensure_no_risk_control(page)
                                 break
+                        except (RewardsRiskControlError, RiskDetectionError):
+                            raise
                         except Exception:
                             continue
                 break
+        except (RewardsRiskControlError, RiskDetectionError):
+            raise
         except Exception:
             continue
 
@@ -287,6 +384,8 @@ def do_daily_set_tasks(page, daily_items: list[dict]) -> int:
                 _handle_activity_page(page)
                 completed += 1
                 print(f"    完成 (弹窗)")
+        except (RewardsRiskControlError, RiskDetectionError):
+            raise
         except Exception as e:
             print(f"    处理失败: {e}")
 
@@ -379,11 +478,15 @@ def do_dashboard_activities(page) -> int:
                         _handle_activity_page(page)
                         completed += 1
                         print(f"    活动完成 (弹窗)")
+                except (RewardsRiskControlError, RiskDetectionError):
+                    raise
                 except Exception as e:
                     print(f"    活动处理异常: {e}")
 
                 safe_goto(page, REWARDS_DASHBOARD, wait_extra=2000)
                 page.wait_for_timeout(1500)
+        except (RewardsRiskControlError, RiskDetectionError):
+            raise
         except Exception:
             continue
 
@@ -394,12 +497,16 @@ def do_dashboard_activities(page) -> int:
     return completed
 
 
-def extract_daily_earn_links(panel_html: str) -> list[dict]:
-    """从 /earn 页「日常任务」面板 HTML 中提取追踪搜索链接"""
+def _strip_html(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", value or "")
+    return re.sub(r"\s+", " ", html_lib.unescape(text)).strip()
+
+
+def extract_daily_offer_tasks(panel_html: str) -> list[dict]:
+    """提取 /earn「日常任务」中网页可完成的搜索与每日拼图。"""
     start = panel_html.find('aria-label="日常任务"')
     if start < 0:
         return []
-    # 触发按钮之后紧跟的 DisclosurePanel 才是任务列表（下一个触发按钮之前）
     panel_start = panel_html.find("react-aria-DisclosurePanel", start)
     if panel_start < 0:
         return []
@@ -408,90 +515,578 @@ def extract_daily_earn_links(panel_html: str) -> list[dict]:
 
     items: list[dict] = []
     seen: set[str] = set()
-    # 逐个卡片块匹配（部分卡片用 <span href> 而非 <a>），便于结合卡片内文本判断是否已完成
-    for m in re.finditer(r'<(?:a|span)\s[^>]*href="([^"]+)"[^>]*target="_blank"[^>]*>(.*?)</(?:a|span)>', panel, re.S):
-        href = m.group(1).replace("&amp;", "&")
-        block = m.group(2)
+    pattern = r'<(?:a|span)\s[^>]*href="([^"]+)"[^>]*target="_blank"[^>]*>(.*?)</(?:a|span)>'
+    for match in re.finditer(pattern, panel, re.S):
+        href = html_lib.unescape(match.group(1))
+        block = match.group(2)
         if href in seen:
             continue
         if "已完成" in block or "Completed" in block:
             continue
-        # 仅限积分商城/应用内完成的任务，网页端做不了，直接跳过
         if "积分商城" in block or "仅限" in block:
             continue
-        # 只做搜索类任务：带追踪参数的 bing 搜索链接
-        if "bing.com/search" not in href:
+        if "bing.com/search" in href:
+            kind = "search"
+        elif "bing.com/spotlight/imagepuzzle" in href:
+            kind = "puzzle"
+        else:
             continue
-        title_m = re.search(r'<img alt="([^"]+)"', block)
-        title = title_m.group(1) if title_m else ""
+        title_match = re.search(r'<img alt="([^"]+)"', block)
+        title = html_lib.unescape(title_match.group(1)) if title_match else ""
+        if not title:
+            title = _strip_html(block)[:80]
         seen.add(href)
-        items.append({"title": title, "url": href})
+        items.append({"title": title, "url": href, "kind": kind})
     return items
 
 
-def _is_app_only_page(pg) -> bool:
-    """判断页面是否提示仅限积分商城应用完成（网页端做不了）"""
+def extract_daily_earn_links(panel_html: str) -> list[dict]:
+    """兼容旧接口：只返回可点击的追踪搜索任务。"""
+    return [
+        {"title": item["title"], "url": item["url"]}
+        for item in extract_daily_offer_tasks(panel_html)
+        if item["kind"] == "search"
+    ]
+
+
+def extract_point_punch_cards(page_html: str) -> list[dict]:
+    """提取明确奖励积分的网页 Punch Card，跳过 App/Xbox/购买类活动。"""
+    cards: list[dict] = []
+    seen: set[str] = set()
+    pattern = r'<a\b([^>]*\bhref="([^"]*_punchcard[^"]*)"[^>]*)>(.*?)</a>'
+    for match in re.finditer(pattern, page_html, re.S):
+        href = html_lib.unescape(match.group(2)).split("?", 1)[0]
+        if href.startswith("/"):
+            href = "https://rewards.bing.com" + href
+        if href in seen:
+            continue
+        block = match.group(3)
+        card_text = _strip_html(block)
+        if "奖励应用" in card_text or "积分商城" in card_text:
+            continue
+        points_match = re.search(r"\+\s*([\d,]+)", card_text)
+        if not points_match:
+            continue
+        title_match = re.search(r"<h3[^>]*>(.*?)</h3>", block, re.S)
+        if not title_match:
+            title_match = re.search(r'<img[^>]+alt="([^"]+)"', block, re.S)
+        title = _strip_html(title_match.group(1)) if title_match else card_text[:80]
+        if not title:
+            continue
+        seen.add(href)
+        cards.append({
+            "title": title,
+            "url": href,
+            "points": int(points_match.group(1).replace(",", "")),
+            "text": card_text,
+        })
+    return cards
+
+
+def _puzzle_goal(size: int = 9) -> tuple[int, ...]:
+    return tuple(range(size - 1)) + (-1,)
+
+
+def _puzzle_is_solved(state, size: int = 9) -> bool:
+    return tuple(state) == _puzzle_goal(size)
+
+
+def _puzzle_solvable(state, rows: int = 3, cols: int = 3) -> bool:
+    values = [v for v in state if v != -1]
+    inversions = sum(
+        1
+        for i, left in enumerate(values)
+        for right in values[i + 1:]
+        if left > right
+    )
+    if cols % 2:
+        return inversions % 2 == 0
+    blank_index = state.index(-1)
+    blank_row_from_bottom = rows - blank_index // cols
+    return (inversions + blank_row_from_bottom) % 2 == 1
+
+
+def solve_sliding_puzzle(state, rows: int = 3, cols: int = 3):
+    """用 A* 求 8 数码最短移动序列；返回待点击坐标，不可解返回 None。"""
+    size = rows * cols
+    start = tuple(state)
+    goal = _puzzle_goal(size)
+    if len(start) != size or set(start) != set(range(-1, size - 1)):
+        return None
+    if start == goal:
+        return []
+    if not _puzzle_solvable(start, rows, cols):
+        return None
+
+    def heuristic(board):
+        distance = 0
+        for index, value in enumerate(board):
+            if value < 0:
+                continue
+            goal_y, goal_x = divmod(value, cols)
+            y, x = divmod(index, cols)
+            distance += abs(y - goal_y) + abs(x - goal_x)
+        return distance
+
+    frontier = [(heuristic(start), 0, start, ())]
+    best = {start: 0}
+    visited = 0
+    while frontier and visited < 200000:
+        _estimate, cost, board, moves = heapq.heappop(frontier)
+        if cost != best.get(board):
+            continue
+        visited += 1
+        if board == goal:
+            return list(moves)
+        blank = board.index(-1)
+        y, x = divmod(blank, cols)
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny, nx = y + dy, x + dx
+            if not (0 <= ny < rows and 0 <= nx < cols):
+                continue
+            neighbor = ny * cols + nx
+            candidate = list(board)
+            candidate[blank], candidate[neighbor] = candidate[neighbor], candidate[blank]
+            candidate_state = tuple(candidate)
+            next_cost = cost + 1
+            if next_cost >= best.get(candidate_state, 10**9):
+                continue
+            best[candidate_state] = next_cost
+            heapq.heappush(
+                frontier,
+                (next_cost + heuristic(candidate_state), next_cost,
+                 candidate_state, moves + ((ny, nx),)),
+            )
+    return None
+
+
+def _read_puzzle_state(page):
+    """按棋盘坐标读取 8 数码状态；空位记为 -1。"""
     try:
-        html = pg.content()
+        slots = page.evaluate(r"""() => Array.from(document.querySelectorAll('#tiles > div.tile[x][y]'))
+          .map((slot) => {
+            const nested = Array.from(slot.querySelectorAll('*'))
+              .find((el) => /^img\d+$/.test(el.id));
+            return {
+              x: Number(slot.getAttribute('x')),
+              y: Number(slot.getAttribute('y')),
+              image: nested ? Number(nested.id.slice(3)) : -1,
+            };
+          })""")
+    except Exception:
+        return None
+    if not isinstance(slots, list) or len(slots) != 9:
+        return None
+    try:
+        # Bing 的 x 是视觉行、y 是视觉列（tile.id = x + y）。
+        by_position = {(int(item["x"]), int(item["y"])): int(item["image"]) for item in slots}
+        state = [by_position[(row, col)] for row in range(3) for col in range(3)]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if sorted(state) != list(range(-1, 8)):
+        return None
+    return state
+
+
+def _puzzle_completed(page) -> bool:
+    try:
+        congrats = page.locator("#congrats").first
+        if congrats.count() > 0 and congrats.is_visible():
+            return True
+    except Exception:
+        pass
+    # 完成后页面会在 3 秒后自动跳转到 Spotlight，跳转成功同样视为完成。
+    try:
+        return "spotlight/imagepuzzle" not in (page.url or "").lower() and "spotlight" in (page.url or "").lower()
     except Exception:
         return False
-    return "积分商城" in html or ("仅限" in html and "应用" in html)
 
 
-def do_daily_earn_tasks(page) -> int:
-    """完成 /earn 页「日常任务」— 点击任务卡片（必须真实点击，直接访问URL不计分）"""
+def complete_image_puzzle(page) -> bool:
+    """按真实点击完成 3x3 拼图；不牺牲步数去点“跳过拼图”。"""
+    if _puzzle_completed(page):
+        print("    拼图已经完成")
+        return True
+
+    for attempt in range(2):
+        _ensure_no_risk_control(page)
+        state = _read_puzzle_state(page)
+        if state is None:
+            print("    无法读取拼图棋盘")
+            return False
+        if _puzzle_is_solved(state):
+            page.wait_for_timeout(2000)
+            return _puzzle_completed(page)
+
+        moves = solve_sliding_puzzle(state)
+        if moves is None:
+            print("    拼图状态不可解，放弃本次")
+            return False
+        print(f"    拼图求解: {len(moves)} 步（第 {attempt + 1} 次）")
+        page.wait_for_timeout(random.randint(700, 1200))
+
+        for index, (x, y) in enumerate(moves):
+            if index % 8 == 0:
+                _ensure_no_risk_control(page)
+            tile = page.locator(f'#tiles > div.tile[x="{x}"][y="{y}"]').first
+            if tile.count() == 0 or not tile.is_visible():
+                print("    拼图棋盘发生变化，重新读取")
+                break
+            try:
+                tile.hover()
+                page.wait_for_timeout(random.randint(30, 90))
+                tile.click(delay=random.randint(70, 160))
+            except Exception as exc:
+                print(f"    拼图点击失败: {str(exc).splitlines()[0][:80]}")
+                break
+            page.wait_for_timeout(random.randint(120, 240))
+
+        page.wait_for_timeout(2200)
+        if _puzzle_completed(page):
+            print("    拼图完成")
+            return True
+
+    print("    拼图未完成，未使用跳过按钮冒充完成")
+    return False
+
+
+def read_streak_progress(page, label: str):
+    """读取首页活动卡片的进度，如 Edge 分钟: 0/30、移动应用 签到: 0/1。"""
+    try:
+        text = page.evaluate("() => document.body.innerText || ''")
+    except Exception:
+        return None
+    patterns = {
+        "edge": r"Microsoft Edge\s*\n\s*分钟:\s*(\d+)\s*/\s*(\d+)",
+        "mobile": r"移动应用\s*\n\s*签到:\s*(\d+)\s*/\s*(\d+)",
+    }
+    match = re.search(patterns[label], text)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _open_edge_streak(page) -> bool:
+    """从新版面板打开 Edge 浏览活动，返回是否进入官方活动页。"""
+    current_url = (getattr(page, "url", "") or "").lower()
+    if "rewards.bing.com/promo/edge-browsing-streak" in current_url:
+        return True
+
+    # 新版卡片是 button，点击后才展开带“使用 Edge”的 dialog。
+    try:
+        card = page.locator('button:has-text("Microsoft Edge"):has-text("分钟")').first
+        if card.count() > 0 and card.is_visible():
+            card.click()
+            page.wait_for_timeout(1500)
+    except Exception:
+        pass
+
+    try:
+        link = page.locator("[role='dialog'] a:has-text('使用 Edge')").first
+        if link.count() > 0 and link.is_visible():
+            # Microsoft 的活动链接有时新开标签，有时当前页跳转；只在确实弹出时取新页。
+            action_ctx = page.context
+            existing = set(action_ctx.pages)
+            link.click()
+            page.wait_for_timeout(3000)
+            opened = [pg for pg in action_ctx.pages if pg not in existing]
+            target = opened[-1] if opened else page
+            if target is not page:
+                target.wait_for_load_state("domcontentloaded", timeout=30000)
+                target.wait_for_timeout(1500)
+            return "edge-browsing-streak" in (target.url or "").lower()
+    except Exception:
+        pass
+    return "edge-browsing-streak" in (getattr(page, "url", "") or "").lower()
+
+
+def _open_mobile_app(page) -> bool:
+    for text in ("立即签入", "下载应用", "打开应用"):
+        try:
+            link = page.locator(f"a:has-text('{text}')").first
+            if link.count() > 0 and link.is_visible():
+                link.click()
+                page.wait_for_timeout(2500)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def do_edge_browsing_streak(page, minutes: int = 30, poll_seconds: int = 60) -> int:
+    """用 Edge 持续真实浏览；仅页面回执到 30/30 时返回 1。"""
+    print("  检查 Edge 浏览连续打卡...")
+    current = read_streak_progress(page, "edge")
+    if current and current[0] >= current[1]:
+        print(f"  Edge 浏览已完成: {current[0]}/{current[1]}")
+        return 1
+    if not current:
+        print("  未读取到 Edge 浏览进度")
+        return 0
+
+    try:
+        if not _open_edge_streak(page):
+            print("  未找到 Edge 浏览入口")
+            return 0
+        target = max(1, min(int(minutes), current[1]))
+        elapsed = 0
+        stable = 0
+        previous = current[0]
+        content_urls = (
+            "https://www.bing.com/search?q=%E4%BB%8A%E6%97%A5%E6%96%B0%E9%97%BB&form=QBRE",
+            "https://www.bing.com/search?q=%E7%A7%91%E6%8A%80%E8%B5%84%E8%AE%AF&form=QBRE",
+            "https://www.bing.com/search?q=%E7%94%9F%E6%B4%BB%E8%B4%A2%E7%BB%8F&form=QBRE",
+        )
+        while elapsed < target * 60:
+            # 先保持 Edge 在真实内容页上操作，而不是空等。
+            content_url = content_urls[(elapsed // 300) % len(content_urls)]
+            safe_goto(page, content_url, wait_extra=1500)
+            for _ in range(10):
+                page.mouse.wheel(0, random.randint(350, 850))
+                page.wait_for_timeout(random.randint(800, 1500))
+            page.wait_for_timeout(max(1000, poll_seconds * 1000 - 12000))
+            elapsed += poll_seconds
+            if elapsed % 300 < poll_seconds:
+                safe_goto(page, REWARDS_DASHBOARD, wait_extra=2000)
+                now = read_streak_progress(page, "edge")
+                if now:
+                    done, total = now
+                    print(f"    Edge 浏览: {done}/{total}（已等待 {elapsed // 60} 分钟）")
+                    if done >= total:
+                        return 1
+                    if done <= previous:
+                        stable += 1
+                        if stable >= 2:
+                            print("    Edge 浏览分钟未上报，停止等待")
+                            return 0
+                    else:
+                        stable = 0
+                        previous = done
+                if not _open_edge_streak(page):
+                    print("  Edge 浏览入口消失，停止")
+                    return 0
+    except Exception as exc:
+        print(f"  Edge 浏览异常: {str(exc).splitlines()[0][:100]}")
+    return 0
+
+def do_mobile_app_checkin(page) -> int:
+    """打开 Bing 手机 App 签到入口；桌面无等价签到时不伪造成功。"""
+    print("  检查必应应用签到...")
+    current = read_streak_progress(page, "mobile")
+    if current and current[0] >= current[1]:
+        print(f"  必应应用签到已完成: {current[0]}/{current[1]}")
+        return 1
+    if not current:
+        print("  未读取到必应应用签到进度")
+        return 0
+
+    try:
+        # 卡片按钮会跳转到 bingapp.microsoft.com；没有手机 App/ADB 时无法完成签到。
+        if not _open_mobile_app(page):
+            print("  未找到必应应用签到入口")
+            return 0
+        if "bingapp.microsoft.com" in page.url.lower():
+            print("  必应应用签到需在 Bing 手机 App 内完成（当前只有下载页），跳过")
+            return 0
+        page.wait_for_timeout(3000)
+        now = read_streak_progress(page, "mobile")
+        if now and now[0] >= now[1]:
+            print("  必应应用签到完成")
+            return 1
+        print("  未确认必应应用签到完成")
+    except Exception as exc:
+        print(f"  必应应用签到异常: {str(exc).splitlines()[0][:100]}")
+    return 0
+
+
+def _first_quest_action(page):
+    """返回限时任务中当前第一个可点击的网页任务入口。"""
+    try:
+        headings = page.locator("main h3")
+        for index in range(headings.count()):
+            heading = headings.nth(index)
+            if not heading.is_visible():
+                continue
+            card = heading.locator("xpath=ancestor::div[2]")
+            if card.count() == 0:
+                continue
+            links = card.locator('a[target="_blank"]')
+            if links.count() == 0:
+                continue
+            link = links.first
+            if not link.is_visible():
+                continue
+            if (link.get_attribute("aria-disabled") or "").lower() == "true":
+                continue
+            href = link.get_attribute("href") or ""
+            if href.startswith("http"):
+                return link
+    except Exception:
+        pass
+    return None
+
+
+def _claim_quest_points(page) -> bool:
+    for selector in (
+        "main button:has-text('领取积分')",
+        "main button:has-text('领取奖励')",
+        "main a:has-text('领取积分')",
+        "main a:has-text('领取奖励')",
+    ):
+        try:
+            button = page.locator(selector).first
+            if button.count() > 0 and button.is_visible() and button.is_enabled():
+                button.click()
+                page.wait_for_timeout(2000)
+                _ensure_no_risk_control(page)
+                return True
+        except (RewardsRiskControlError, RiskDetectionError):
+            raise
+        except Exception:
+            continue
+    return False
+
+
+def do_point_punch_cards(page) -> int:
+    """每次运行最多推进一步明确奖励积分的 Punch Card。"""
+    print("  扫描限时积分活动...")
+    safe_goto(page, REWARDS_EARN_PAGE, wait_extra=2500)
+    _ensure_no_risk_control(page)
+    cards = extract_point_punch_cards(page.content())
+    if not cards:
+        print("  未找到可自动化的限时积分活动")
+        return 0
+
+    print(f"  找到 {len(cards)} 个限时积分活动")
+    for card in cards:
+        print(f"  检查: {card['title']} (+{card['points']})")
+        safe_goto(page, card["url"], wait_extra=2500)
+        _ensure_no_risk_control(page)
+        text = page.evaluate("() => document.body.innerText || ''")
+        progress = re.search(r"(?:状态:\s*)?(\d+)\s*/\s*(\d+)\s*个任务", text)
+        if progress and progress.group(1) == progress.group(2):
+            if _claim_quest_points(page):
+                _ensure_no_risk_control(page)
+                print("    已领取活动积分")
+                return 1
+            print("    活动已完成，无待领取按钮")
+            continue
+
+        action = _first_quest_action(page)
+        if action is None:
+            print("    当前没有可点击的网页任务，等待下次运行")
+            continue
+
+        try:
+            action_text = (action.inner_text() or "").strip()[:60]
+            print(f"    点击任务: {action_text}")
+            new_page = None
+            try:
+                with page.context.expect_page(timeout=10000):
+                    action.click(delay=random.randint(70, 180))
+                new_page = page.context.pages[-1]
+            except Exception:
+                new_page = None
+            target = new_page if new_page is not None and new_page != page else page
+            try:
+                target.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            target.wait_for_timeout(random.randint(3500, 5500))
+            _ensure_no_risk_control(target)
+            _random_scroll(target)
+            target.wait_for_timeout(random.randint(1500, 3000))
+            if new_page is not None:
+                new_page.close()
+        except (RewardsRiskControlError, RiskDetectionError):
+            raise
+        except Exception as exc:
+            print(f"    任务执行异常: {str(exc).splitlines()[0][:100]}")
+
+        safe_goto(page, card["url"], wait_extra=2000)
+        _ensure_no_risk_control(page)
+        updated = page.evaluate("() => document.body.innerText || ''")
+        updated_match = re.search(r"(?:状态:\s*)?(\d+)\s*/\s*(\d+)\s*个任务", updated)
+        if updated_match:
+            done = int(updated_match.group(1))
+            total = int(updated_match.group(2))
+            print(f"    当前进度: {done}/{total}")
+            if progress:
+                before = int(progress.group(1))
+                if done <= before:
+                    print("    进度未变化，本次不计为完成")
+                    continue
+            return 1
+        print("    未读到任务进度，保守起见不计为完成")
+        continue
+
+    return 0
+
+
+def _open_task_card(page, title: str):
+    card = page.locator(f'[target="_blank"]:has(img[alt="{title}"])').first
+    if card.count() == 0 or not card.is_visible():
+        return None
+    try:
+        with page.context.expect_page(timeout=10000):
+            card.click(delay=random.randint(60, 160))
+        return page.context.pages[-1]
+    except Exception:
+        return None
+
+
+def do_daily_offer_tasks(page) -> int:
+    """完成 /earn 日常搜索与每日拼图。"""
     print("  打开积分赚取页...")
     safe_goto(page, REWARDS_EARN_PAGE, wait_extra=3000)
-
-    items = extract_daily_earn_links(page.content())
+    _ensure_no_risk_control(page)
+    items = extract_daily_offer_tasks(page.content())
     if not items:
         print("  未找到待完成的日常任务")
         return 0
 
     print(f"  待完成日常任务: {len(items)} 个")
     completed = 0
-    for idx, item in enumerate(items):
-        title = item.get("title") or f"任务{idx+1}"
-        print(f"  [{idx+1}/{len(items)}] {title}")
+    for index, item in enumerate(items):
+        title = item.get("title") or f"任务{index + 1}"
+        print(f"  [{index + 1}/{len(items)}] {title} ({item['kind']})")
         try:
-            # 每个任务前回到赚取页并点击对应卡片
             safe_goto(page, REWARDS_EARN_PAGE, wait_extra=2000)
-            card = page.locator(f'[target="_blank"]:has(img[alt="{title}"])').first
-            if card.count() == 0 or not card.is_visible():
-                print(f"    未找到任务卡片，跳过")
+            new_page = _open_task_card(page, title)
+            if new_page is None:
+                print("    未找到任务卡片，跳过")
                 continue
-
-            new_page = None
             try:
-                with page.context.expect_page(timeout=10000):
-                    card.click(delay=random.randint(50, 200))
-                new_page = page.context.pages[-1]
-            except Exception:
-                new_page = None
-
-            if new_page is not None and new_page != page:
                 new_page.wait_for_load_state("domcontentloaded", timeout=15000)
-                if _is_app_only_page(new_page):
-                    print("    仅限积分商城应用完成，跳过")
-                    new_page.close()
-                    random_sleep(short_range=(1, 3))
-                    continue
-                page.wait_for_timeout(random.randint(3000, 5000))
-                _random_scroll(new_page)
-                new_page.close()
+            except Exception:
+                pass
+            _ensure_no_risk_control(new_page)
+
+            if item["kind"] == "puzzle":
+                ok = complete_image_puzzle(new_page)
+            elif _is_app_only_page(new_page):
+                print("    仅限积分商城应用完成，跳过")
+                ok = False
             else:
-                # 未开新标签：可能同页跳转或弹窗，稍作停留
-                if _is_app_only_page(page):
-                    print("    仅限积分商城应用完成，跳过")
-                    random_sleep(short_range=(1, 3))
-                    continue
-                page.wait_for_timeout(random.randint(3000, 5000))
-                _random_scroll(page)
-            completed += 1
-            print(f"    完成")
-        except Exception as e:
-            print(f"    失败: {e}")
+                new_page.wait_for_timeout(random.randint(3500, 5500))
+                _random_scroll(new_page)
+                ok = True
+
+            if new_page != page:
+                new_page.close()
+            if ok:
+                completed += 1
+                print("    完成")
+        except (RewardsRiskControlError, RiskDetectionError):
+            raise
+        except Exception as exc:
+            print(f"    失败: {str(exc).splitlines()[0][:100]}")
         random_sleep(short_range=(1, 3))
 
     print(f"  完成 {completed} 个日常任务")
     return completed
+
+
+def do_daily_earn_tasks(page) -> int:
+    """兼容入口：处理日常任务面板中的搜索和拼图。"""
+    return do_daily_offer_tasks(page)

@@ -1,23 +1,118 @@
 """Microsoft OAuth 登录流程"""
 
 
+# 凭据选择页（"使用另一种方式登录"）上"使用密码"选项的候选定位器。
+# 设备上存在 passkey/Windows Hello 时，login.live.com 会跳过邮箱输入，
+# 直接落到该页，此时必须先点"使用密码"才能进入密码输入。
+PASSWORD_TILE_SELECTORS = (
+    '[aria-label="使用密码"]',
+    '[aria-label="Use your password"]',
+    'div[role="button"]:has-text("使用密码")',
+    'div[role="button"]:has-text("Use your password")',
+    'button:has-text("使用密码")',
+    'button:has-text("Use your password")',
+    "#idA_PWD_SwitchToPassword",
+    "#idA_PWD_SwitchToCredPicker",
+)
+
+# "使用另一种方式登录"/"其他登录方式"的候选定位器。
+ALT_LOGIN_SELECTORS = (
+    "a:has-text('使用另一种方式登录')",
+    "a:has-text('其他登录方式')",
+    "a:has-text('Use another account')",
+    "button:has-text('使用另一种方式登录')",
+    "#idA_PWD_SwitchToCredPicker",
+    "#otherOptions",
+    "[role='link']:has-text('使用另一种方式登录')",
+)
+
+
+def _first_visible(page, selectors, timeout_ms: int = 0):
+    """按顺序返回第一个可见可用的定位器，找不到返回 None"""
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if timeout_ms:
+                loc.wait_for(state="visible", timeout=timeout_ms)
+            if loc.count() > 0 and loc.is_visible():
+                return loc
+        except Exception:
+            continue
+    return None
+
+
+def _click_first(page, selectors) -> bool:
+    """点击第一个可见的候选元素，成功返回 True"""
+    loc = _first_visible(page, selectors)
+    if loc is None:
+        return False
+    try:
+        loc.click()
+        return True
+    except Exception:
+        return False
+
+
+EMAIL_INPUT_SELECTORS = (
+    "#usernameEntry",
+    "input[name='loginfmt']",
+    "input[type='email']",
+)
+
+
+def _wait_for_email_input(page, timeout_ms: int = 12000):
+    """等邮箱框出现（登录页 JS 渲染需要时间，立即判断会误判为没有）"""
+    for sel in EMAIL_INPUT_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            loc.wait_for(state="visible", timeout=timeout_ms)
+            if loc.count() > 0:
+                return loc
+        except Exception:
+            continue
+    return None
+
+
 def do_login(page, username: str, password: str) -> bool:
     print(f"  登录账号: {username}")
 
-    # 确保在登录页
+    # 确保在登录页。部分网络环境下 Edge 对 login.live.com 的 HTTP/2 协商会
+    # 间歇性失败（net::ERR_HTTP2_PROTOCOL_ERROR），所以这里重试而不是一次定生死。
     if "login.live.com" not in page.url.lower():
-        page.goto("https://login.live.com/", timeout=30000)
+        for attempt in range(1, 4):
+            try:
+                page.goto("https://login.live.com/", timeout=30000, wait_until="domcontentloaded")
+                if "chrome-error" not in page.url:
+                    break
+            except Exception as exc:
+                print(f"  打开登录页失败(第{attempt}次): {str(exc).splitlines()[0][:80]}")
+            page.wait_for_timeout(3000)
         page.wait_for_timeout(2000)
 
-    # 1. 输入邮箱
-    email_input = page.locator("#usernameEntry").first
-    if email_input.count() == 0 or not email_input.is_visible():
-        email_input = page.locator("input[name='loginfmt']").first
-    if email_input.count() == 0 or not email_input.is_visible():
-        email_input = page.locator("input[type='email']").first
+    email_input = _wait_for_email_input(page)
 
-    if email_input.count() == 0:
+    # 邮箱框没出现：可能直接落在了凭据选择页（设备上有 passkey/Windows Hello）。
+    # 此时点"使用密码"或"使用另一种方式登录"才能继续。
+    if email_input is None:
+        for attempt in range(1, 4):
+            print(f"  未直接出现邮箱框，尝试切换到密码登录 (第{attempt}次)...")
+            if _click_first(page, PASSWORD_TILE_SELECTORS) or _click_first(page, ALT_LOGIN_SELECTORS):
+                page.wait_for_timeout(3000)
+                email_input = _wait_for_email_input(page)
+                if email_input is not None:
+                    break
+                # 可能出现"输入邮箱"选项
+                if _click_first(page, ("a:has-text('使用其他帐户')", "a:has-text('Use another account')")):
+                    page.wait_for_timeout(2000)
+                    email_input = _wait_for_email_input(page)
+                    if email_input is not None:
+                        break
+            else:
+                page.wait_for_timeout(2000)
+
+    if email_input is None:
         print("  ✗ 未找到邮箱输入框")
+        print(f"    当前URL: {page.url[:120]}")
         return False
 
     email_input.click()
@@ -180,5 +275,70 @@ def do_login(page, username: str, password: str) -> bool:
     print(f"  登录后URL: {url_now[:100]}")
     if "login.live.com" in url_now or "login.microsoft" in url_now:
         print("  ✗ 登录未成功，仍在登录页面（可能需要验证码/2FA/密码错误）")
+        return False
+    return True
+
+
+LOGIN_URL = "https://login.live.com/"
+
+
+def get_logged_in_identity(page) -> str | None:
+    """读取当前 Rewards 账号邮箱（signInName 或账号块的 RSC 数据）。"""
+    import re
+    try:
+        html = page.content()
+    except Exception:
+        return None
+
+    # 旧版/部分页面直接输出 signInName。
+    match = re.search(r'"signInName"\s*:\s*"([^"]+)"', html, re.I)
+    if match and "@" in match.group(1):
+        return match.group(1).strip().lower()
+
+    # 新版 RSC 账号块里的 JSON 引号是转义形式：
+    # \"className\":\"pii truncate\",\"children\":\"user@example.com\"
+    match = re.search(
+        r'\\"className\\":\\"pii truncate\\",\\"children\\":\\"'
+        r'([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\\"',
+        html,
+        re.I,
+    )
+    if match:
+        return match.group(1).strip().lower()
+
+    # 已经渲染 MeControl 弹窗时，优先读明确的账号元素。
+    try:
+        identity = page.evaluate(r"""() => {
+          const root = document.querySelector(
+            '#mectrl_currentAccount_primary, [data-testid="account-email"]'
+          );
+          if (!root) return null;
+          const text = root.textContent || root.getAttribute('aria-label') || '';
+          const match = text.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+          return match ? match[0] : null;
+        }""")
+    except Exception:
+        identity = None
+    return identity.strip().lower() if isinstance(identity, str) and "@" in identity else None
+
+def ensure_account(page, username: str, password: str) -> bool:
+    """确认页面登录的是目标账号；无法读取身份时安全停止，不猜测。"""
+    current = get_logged_in_identity(page)
+    if current is None:
+        print("  无法读取当前账号 signInName，安全停止，不擅自切换账号")
+        return False
+    if current == username.lower():
+        return True
+    print(f"  当前登录账号 {current} 与目标 {username} 不一致，切换账号")
+    try:
+        page.goto("https://login.live.com/logout.srf", timeout=30000, wait_until="domcontentloaded")
+        page.wait_for_timeout(2500)
+    except Exception:
+        pass
+    if not do_login(page, username, password):
+        return False
+    verified = get_logged_in_identity(page)
+    if verified != username.lower():
+        print("  登录后仍无法确认目标账号，安全停止")
         return False
     return True

@@ -4,3 +4,8 @@ accounts.txt
 __pycache__/
 tests/__pycache__/
 tmp_playwright_profile/
+tmp_playwright_profile_mobile/
+tmp_playwright_temp/
+logs/
+# 失败推送的 SMTP 凭据：只提交 .env.example
+.env

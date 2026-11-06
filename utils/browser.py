@@ -6,6 +6,20 @@ from urllib.parse import quote_plus
 from utils.config import BING_HOME
 
 
+class BrowserRiskControlError(RuntimeError):
+    """搜索中出现微软验证码或限制页时停止当前账号。"""
+
+
+def _detect_search_risk(page):
+    """只认微软/Bing 的验证组件或明确验证页，忽略普通正文中的“验证码”。"""
+    from utils.tasks import RiskDetectionError, detect_risk_control
+    try:
+        return detect_risk_control(page)
+    except RiskDetectionError:
+        # 检测失败单独分类，由 main 返回退出码 5，不能伪装成真实风控。
+        raise
+
+
 def random_sleep(short_range=(0.5, 2.0), long_prob=0.1, long_range=(3, 8)):
     if long_prob and random.random() < long_prob:
         time.sleep(random.uniform(*long_range))
@@ -28,13 +42,22 @@ def safe_goto(page, url: str, timeout: int = 30000, wait_extra: int = 3000):
 
 def do_bing_search(page, keyword: str):
     """执行一次Bing搜索 — 优先用直接URL避免搜索框问题"""
+    from utils.tasks import RiskDetectionError
     try:
         # 直接用搜索URL，最可靠
         search_url = f"https://www.bing.com/search?q={quote_plus(keyword)}&form=QBRE"
         safe_goto(page, search_url)
+        risk = _detect_search_risk(page)
+        if risk:
+            raise BrowserRiskControlError(risk)
         random_sleep(short_range=(4, 7))
         _random_scroll(page)
         _random_click_result(page)
+        risk = _detect_search_risk(page)
+        if risk:
+            raise BrowserRiskControlError(risk)
+    except (BrowserRiskControlError, RiskDetectionError):
+        raise
     except Exception as e:
         print(f"    搜索异常: {e}")
         # 最终回退：Bing首页手动搜索
@@ -102,14 +125,24 @@ def do_searches(page, count: int, keywords: list, tag: str, verify=None):
     for i in range(count):
         keyword = next(cycle)
         do_bing_search(page, keyword)
+        risk = _detect_search_risk(page)
+        if risk:
+            raise BrowserRiskControlError(risk)
         if verify and (i + 1) % 4 == 0:
             score = verify()
             if score and prev_score and score == prev_score:
                 stable_checks += 1
                 print(f"    积分无增长({score})，连续 {stable_checks} 次")
                 if stable_checks >= 2:
-                    print(f"  {tag} 积分已达上限，提前结束（实际执行 {i + 1} 次）")
-                    return
+                    # 最终确认一次，避免计分延迟导致误停
+                    time.sleep(30)
+                    confirm = verify()
+                    if confirm and confirm == score:
+                        print(f"  {tag} 积分已达上限，提前结束（实际执行 {i + 1} 次）")
+                        return
+                    stable_checks = 0
+                    if confirm:
+                        prev_score = confirm
             else:
                 stable_checks = 0
             if score:
