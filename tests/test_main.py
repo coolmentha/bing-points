@@ -232,30 +232,97 @@ def test_do_searches_skips_when_count_zero(monkeypatch):
 def test_do_searches_skips_when_no_keywords(monkeypatch):
     called = {"n": 0}
     monkeypatch.setattr(browser, "do_bing_search", lambda *_: called.__setitem__("n", called["n"] + 1))
-    browser.do_searches(object(), 3, [], "PC")
+    outcome = browser.do_searches(object(), 3, [], "PC")
     assert called["n"] == 0
+    assert outcome.status is browser.SearchStatus.NO_KEYWORDS
+    assert outcome.completed == 0
+
+
+def test_do_bing_search_old_same_keyword_page_with_navigation_failure_is_not_success():
+    """旧页面已经是同关键词结果页时，也不能把失败导航当成本次搜索成功。"""
+
+    class OldSameResultPage:
+        url = "https://www.bing.com/search?q=same&form=QBRE"
+
+        def goto(self, *_args, **_kwargs):
+            raise RuntimeError("navigation failed")
+
+        def wait_for_load_state(self, *_args, **_kwargs):
+            raise RuntimeError("load failed")
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+        def evaluate(self, _script):
+            return {"readyState": "complete", "hasBody": True}
+
+        def locator(self, _selector):
+            raise AssertionError("stale page must not be used as search success")
+
+    assert browser.do_bing_search(OldSameResultPage(), "same") is False
+
+
+def test_do_bing_search_old_same_keyword_page_with_none_response_is_not_success():
+    """同关键词旧页面 + goto 返回 None 也必须失败，不能把旧页面当本次导航。"""
+
+    class OldSameResultPage:
+        url = "https://www.bing.com/search?q=same&form=QBRE"
+
+        def goto(self, *_args, **_kwargs):
+            return None
+
+        def wait_for_load_state(self, *_args, **_kwargs):
+            return None
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+        def evaluate(self, _script):
+            return {"readyState": "complete", "hasBody": True}
+
+        def locator(self, _selector):
+            raise AssertionError("stale page must not be used as search success")
+
+    assert browser.do_bing_search(OldSameResultPage(), "same") is False
 
 
 def test_do_searches_runs_requested_count(monkeypatch):
     called = {"n": 0}
-    monkeypatch.setattr(browser, "do_bing_search", lambda *_: called.__setitem__("n", called["n"] + 1))
+    real_do_bing_search = browser.do_bing_search
+    monkeypatch.setattr(browser, "do_bing_search", lambda *_: (called.__setitem__("n", called["n"] + 1), True)[1])
+    monkeypatch.setattr(browser, "_real_do_bing_search", real_do_bing_search, raising=False)
     monkeypatch.setattr(browser.time, "sleep", lambda *_: None)
-    browser.do_searches(object(), 3, ["a", "b"], "PC")
+    outcome = browser.do_searches(object(), 3, ["a", "b"], "PC")
     assert called["n"] == 3
+    assert outcome.status is browser.SearchStatus.COMPLETED
+    assert outcome.completed == 3
+    # safe_goto 吞异常时也不能把未到达的页面计为完成。
+    class WrongUrlPage:
+        url = "https://rewards.bing.com/dashboard"
+        def goto(self, *_a, **_k): raise RuntimeError("navigation failed")
+        def wait_for_load_state(self, *_a, **_k): raise RuntimeError("load failed")
+        def wait_for_timeout(self, *_a, **_k): return None
+    monkeypatch.setattr(browser, "_detect_search_risk", lambda _page: None)
+    monkeypatch.setattr(browser, "random_sleep", lambda *a, **k: None)
+    assert real_do_bing_search(WrongUrlPage(), "synthetic") is False
+    monkeypatch.setattr(browser, "do_bing_search", real_do_bing_search)
+    assert browser.do_searches(WrongUrlPage(), 3, ["a", "b"], "PC").status is browser.SearchStatus.INTERRUPTED
 
 
 def test_do_searches_stops_when_score_stalls(monkeypatch):
     """积分余额连续2次核对无增长 → 提前结束（每4次核对一次）"""
     called = {"n": 0}
-    monkeypatch.setattr(browser, "do_bing_search", lambda *_: called.__setitem__("n", called["n"] + 1))
+    monkeypatch.setattr(browser, "do_bing_search", lambda *_: (called.__setitem__("n", called["n"] + 1), True)[1])
     monkeypatch.setattr(browser.time, "sleep", lambda *_: None)
-    browser.do_searches(object(), 20, ["a", "b"], "PC", verify=lambda: 100)
+    outcome = browser.do_searches(object(), 20, ["a", "b"], "PC", verify=lambda: 100)
     assert called["n"] == 8  # 基线1次 + 第4、8次核对，连续2次无增长 → 第8次后停
+    assert outcome.status is browser.SearchStatus.SCORE_STALLED
+    assert outcome.completed == 8
 
 
 def test_do_searches_continues_while_score_grows(monkeypatch):
     called = {"n": 0}
-    monkeypatch.setattr(browser, "do_bing_search", lambda *_: called.__setitem__("n", called["n"] + 1))
+    monkeypatch.setattr(browser, "do_bing_search", lambda *_: (called.__setitem__("n", called["n"] + 1), True)[1])
     monkeypatch.setattr(browser.time, "sleep", lambda *_: None)
     scores = iter([100, 112, 124, 136, 148, 160])
     browser.do_searches(object(), 20, ["a", "b"], "PC", verify=lambda: next(scores))
@@ -265,9 +332,9 @@ def test_do_searches_continues_while_score_grows(monkeypatch):
 def test_do_searches_full_count_when_score_unreadable(monkeypatch):
     """余额解析失败(None/0)不触发提前停止，跑满计划次数"""
     called = {"n": 0}
-    monkeypatch.setattr(browser, "do_bing_search", lambda *_: called.__setitem__("n", called["n"] + 1))
+    monkeypatch.setattr(browser, "do_bing_search", lambda *_: (called.__setitem__("n", called["n"] + 1), True)[1])
     monkeypatch.setattr(browser.time, "sleep", lambda *_: None)
-    browser.do_searches(object(), 6, ["a", "b"], "PC", verify=lambda: None)
+    assert browser.do_searches(object(), 6, ["a", "b"], "PC", verify=lambda: None).completed == 6
     assert called["n"] == 6
 
 
@@ -480,7 +547,7 @@ def test_do_searches_stops_on_risk_page(monkeypatch):
             return {"component": False, "title": "Microsoft", "text": ""}
 
     called = {"n": 0}
-    monkeypatch.setattr(browser, "do_bing_search", lambda *_: called.__setitem__("n", called["n"] + 1))
+    monkeypatch.setattr(browser, "do_bing_search", lambda *_: (called.__setitem__("n", called["n"] + 1), True)[1])
     with pytest.raises(browser.BrowserRiskControlError):
         browser.do_searches(RiskBrowserPage(), 3, ["a", "b"], "PC")
     assert called["n"] == 1
@@ -791,12 +858,13 @@ def test_run_account_risk_detection_error_returns_five(monkeypatch, tmp_path):
 
 
 def _stub_main_run_for_notifications(
-    monkeypatch, *, run_results=(False,), allow_multi=True, guard=None
+    monkeypatch, *, run_results=(False,), allow_multi=True, guard=None, accounts=None
 ):
     import main as main_module
 
     state = {"run_results": list(run_results)}
-    monkeypatch.setattr(main_module, "load_accounts", lambda: [("u@example.com", "p")])
+    account_list = accounts or [("u@example.com", "p")]
+    monkeypatch.setattr(main_module, "load_accounts", lambda: list(account_list))
     monkeypatch.setattr(
         main_module, "run_account", lambda *a, **k: state["run_results"].pop(0)
     )
@@ -862,6 +930,22 @@ def test_main_sends_failure_notification_once(monkeypatch):
     assert main_module.main() == 3
     assert len(calls) == 1
     assert calls[0][0] == 3
+
+
+def test_main_partial_account_failure_returns_six_and_notifies_once(monkeypatch):
+    main_module = _stub_main_run_for_notifications(
+        monkeypatch,
+        run_results=(True, False),
+        accounts=[("ok@example.com", "p1"), ("failed@example.com", "p2")],
+    )
+    from utils import notify
+
+    calls = []
+    monkeypatch.setattr(notify, "notify_failure", lambda *a, **k: calls.append(a) or True)
+
+    assert main_module.main() == 6
+    assert len(calls) == 1
+    assert calls[0][0] == 6
 
 
 def test_main_does_not_send_notification_on_success(monkeypatch):
@@ -992,6 +1076,11 @@ def test_failure_body_contains_run_identity_and_no_smtp_secret(monkeypatch, tmp_
     assert "2026-11-08 19:58:38" in body
     assert "2026-11-08 20:05:00" in body
     assert "synthetic-smtp-secret" not in body
+
+    expected_reason = "部分账号处理失败（至少一个账号成功、至少一个失败）"
+    assert expected_reason in notify.build_subject(6)
+    assert expected_reason in notify.build_body(6)
+    assert notify.EXIT_CODE_REASONS[6] == expected_reason
 
 
 def test_notification_log_tail_uses_this_run_log_not_newer_log(monkeypatch, tmp_path):
@@ -3031,6 +3120,168 @@ def _run_account_with_mobile_result(monkeypatch, mobile_result, devices, webview
     monkeypatch.setattr(main_module, "DEFAULT_MOBILE_SEARCHES", 0)
     ctx = type("C", (), {"new_page": lambda self: Page()})()
     return main_module.run_account(None, ctx, "u", "p", True), calls, claim_calls
+
+
+def _run_account_with_dashboard_checks(
+    monkeypatch, *, final_dashboard, search_status_name, search_completed,
+    requested_searches=3,
+):
+    import main as main_module
+
+    calls = {"claim": 0, "search": 0, "mobile": 0, "webview": 0}
+    initial_dashboard = {
+        "claimable_points": 0,
+        "daily_set_items": [],
+        "daily_activities_done": 3,
+        "daily_activities_total": 3,
+        "pc_search_done": 0,
+        "pc_search_total": 0,
+    }
+    dashboard_results = iter([dict(initial_dashboard), dict(final_dashboard)])
+
+    class Page:
+        url = "https://rewards.bing.com/dashboard"
+        def goto(self, *_a, **_k): pass
+        def wait_for_timeout(self, *_): pass
+        def close(self): pass
+
+    class Context:
+        def new_page(self):
+            return Page()
+
+    monkeypatch.setattr(main_module, "do_login", lambda *a, **k: True)
+    monkeypatch.setattr(main_module, "ensure_account", lambda *a, **k: True)
+    monkeypatch.setattr(main_module, "safe_goto", lambda *a, **k: None)
+    monkeypatch.setattr(main_module, "detect_risk_control", lambda _p: None)
+    monkeypatch.setattr(main_module, "parse_dashboard_data", lambda _p: next(dashboard_results))
+    monkeypatch.setattr(
+        main_module,
+        "claim_available_points",
+        lambda *a, **k: calls.__setitem__("claim", calls["claim"] + 1) or 0,
+    )
+    monkeypatch.setattr(main_module, "do_daily_set_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_dashboard_activities", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_daily_offer_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_point_punch_cards", lambda *a, **k: 0)
+
+    def fake_searches(*_a, **_k):
+        calls["search"] += 1
+        status = getattr(browser.SearchStatus, search_status_name)
+        return browser.SearchOutcome(
+            status=status,
+            requested=requested_searches,
+            completed=search_completed,
+        )
+
+    monkeypatch.setattr(main_module, "do_searches", fake_searches)
+    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.USER_DATA_DIR)
+    monkeypatch.setattr(main_module, "DEFAULT_PC_SEARCHES", requested_searches)
+    monkeypatch.setattr(main_module, "DEFAULT_MOBILE_SEARCHES", 0)
+    monkeypatch.setattr(
+        main_module,
+        "mobile_checkin",
+        lambda *a, **k: calls.__setitem__("mobile", calls["mobile"] + 1) or 1,
+    )
+    monkeypatch.setattr(main_module, "list_android_devices", lambda: [])
+    monkeypatch.setattr(
+        main_module,
+        "run_rewards_desktop_task",
+        lambda *a, **k: calls.__setitem__("webview", calls["webview"] + 1)
+        or clients.REWARDS_DESKTOP_NO_TASK,
+    )
+
+    result = main_module.run_account(None, Context(), "u", "p", True)
+    return result, calls
+
+
+def test_run_account_fails_when_daily_set_tasks_remain(monkeypatch, capsys):
+    result, calls = _run_account_with_dashboard_checks(
+        monkeypatch,
+        final_dashboard={
+            "claimable_points": 0,
+            "daily_set_items": [{"title": "剩余任务"}],
+            "daily_activities_done": 3,
+            "daily_activities_total": 3,
+            "pc_search_done": 0,
+            "pc_search_total": 0,
+        },
+        search_status_name="COMPLETED",
+        search_completed=3,
+    )
+
+    assert result is False
+    assert "仍有每日任务" in capsys.readouterr().out
+    assert calls == {"claim": 4, "search": 1, "mobile": 1, "webview": 1}
+
+
+def test_run_account_fails_when_daily_activities_incomplete(monkeypatch, capsys):
+    result, calls = _run_account_with_dashboard_checks(
+        monkeypatch,
+        final_dashboard={
+            "claimable_points": 0,
+            "daily_set_items": [],
+            "daily_activities_done": 2,
+            "daily_activities_total": 3,
+            "pc_search_done": 0,
+            "pc_search_total": 0,
+        },
+        search_status_name="COMPLETED",
+        search_completed=3,
+    )
+
+    assert result is False
+    assert "每日活动未完成" in capsys.readouterr().out
+    assert calls == {"claim": 4, "search": 1, "mobile": 1, "webview": 1}
+
+
+@pytest.mark.parametrize(
+    ("status_name", "completed"),
+    [
+        ("NO_KEYWORDS", 0),
+        ("SCORE_STALLED", 2),
+        ("INTERRUPTED", 1),
+        ("COMPLETED", 2),
+    ],
+)
+def test_run_account_fails_when_pc_search_not_completed(
+    monkeypatch, capsys, status_name, completed
+):
+    result, calls = _run_account_with_dashboard_checks(
+        monkeypatch,
+        final_dashboard={
+            "claimable_points": 0,
+            "daily_set_items": [],
+            "daily_activities_done": 3,
+            "daily_activities_total": 3,
+            "pc_search_done": 0,
+            "pc_search_total": 0,
+        },
+        search_status_name=status_name,
+        search_completed=completed,
+    )
+
+    assert result is False
+    assert "PC 搜索未完成" in capsys.readouterr().out
+    assert calls["search"] == 1
+
+
+def test_run_account_continues_when_required_daily_tasks_and_search_complete(monkeypatch):
+    result, calls = _run_account_with_dashboard_checks(
+        monkeypatch,
+        final_dashboard={
+            "claimable_points": 0,
+            "daily_set_items": [],
+            "daily_activities_done": 3,
+            "daily_activities_total": 3,
+            "pc_search_done": 0,
+            "pc_search_total": 0,
+        },
+        search_status_name="COMPLETED",
+        search_completed=3,
+    )
+
+    assert result is True
+    assert calls == {"claim": 4, "search": 1, "mobile": 1, "webview": 1}
 
 
 def test_run_account_skips_mobile_without_android_device(monkeypatch, capsys):

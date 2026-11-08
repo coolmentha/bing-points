@@ -1,13 +1,39 @@
 """浏览器会话通用操作：随机行为模拟、导航、批量搜索"""
 import random
 import time
-from urllib.parse import quote_plus
+from dataclasses import dataclass
+from enum import Enum
+from urllib.parse import parse_qs, quote_plus, urlsplit
 
 from utils.config import BING_HOME
 
 
 class BrowserRiskControlError(RuntimeError):
     """搜索中出现微软验证码或限制页时停止当前账号。"""
+
+
+class SearchStatus(str, Enum):
+    """批量搜索的明确终态，不能再用 None 混淆成功与未执行。"""
+
+    COMPLETED = "completed"
+    NO_KEYWORDS = "no_keywords"
+    SCORE_STALLED = "score_stalled"
+    INTERRUPTED = "interrupted"
+
+
+@dataclass(frozen=True)
+class SearchOutcome:
+    status: SearchStatus
+    requested: int
+    completed: int
+
+    @property
+    def success(self) -> bool:
+        return (
+            self.status is SearchStatus.COMPLETED
+            and self.requested > 0
+            and self.completed >= self.requested
+        )
 
 
 def _detect_search_risk(page):
@@ -40,36 +66,115 @@ def safe_goto(page, url: str, timeout: int = 30000, wait_extra: int = 3000):
     page.wait_for_timeout(wait_extra)
 
 
-def do_bing_search(page, keyword: str):
-    """执行一次Bing搜索 — 优先用直接URL避免搜索框问题"""
-    from utils.tasks import RiskDetectionError
+def _is_confirmed_bing_search(page, keyword: str) -> bool:
+    """确认当前页面确实是本次关键词的 Bing 搜索结果页且 DOM 可读。"""
     try:
-        # 直接用搜索URL，最可靠
-        search_url = f"https://www.bing.com/search?q={quote_plus(keyword)}&form=QBRE"
-        safe_goto(page, search_url)
-        risk = _detect_search_risk(page)
-        if risk:
-            raise BrowserRiskControlError(risk)
-        random_sleep(short_range=(4, 7))
-        _random_scroll(page)
-        _random_click_result(page)
-        risk = _detect_search_risk(page)
-        if risk:
-            raise BrowserRiskControlError(risk)
+        parsed = urlsplit(str(page.url))
+    except Exception:
+        return False
+
+    host = (parsed.hostname or "").lower()
+    if host != "bing.com" and not host.endswith(".bing.com"):
+        return False
+    if parsed.path.rstrip("/") != "/search":
+        return False
+
+    try:
+        query = parse_qs(parsed.query).get("q", [""])[0].strip()
+    except Exception:
+        return False
+    if query != keyword.strip():
+        return False
+
+    try:
+        state = page.evaluate(
+            """() => ({
+                readyState: document.readyState,
+                hasBody: Boolean(document.body)
+            })"""
+        )
+    except Exception:
+        return False
+    return (
+        isinstance(state, dict)
+        and state.get("readyState") in ("interactive", "complete")
+        and state.get("hasBody") is True
+    )
+
+
+def _navigate_confirmed(page, url: str) -> bool:
+    """执行一次真实导航并返回是否发生成功导航。
+
+    不能只检查最终 URL/DOM：旧页面可能已经停留在同一个目标 URL，
+    此时被吞掉的导航失败会造成假成功。
+    """
+    before_url = ""
+    try:
+        before_url = str(page.url or "")
+    except Exception:
+        pass
+    try:
+        response = page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        if response is None or (hasattr(response, "ok") and not response.ok):
+            return False
+    except Exception:
+        return False
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    try:
+        page.wait_for_timeout(3000)
+    except Exception:
+        pass
+    try:
+        after_url = str(page.url or "")
+    except Exception:
+        return False
+    return bool(after_url)
+
+
+def do_bing_search(page, keyword: str) -> bool:
+    """执行一次 Bing 搜索，只有本次导航成功且到达对应结果页才返回 True。"""
+    from utils.tasks import RiskDetectionError
+
+    search_url = f"https://www.bing.com/search?q={quote_plus(keyword)}&form=QBRE"
+    try:
+        if not _navigate_confirmed(page, search_url):
+            print("    搜索导航失败，尝试首页回退")
+        elif not _is_confirmed_bing_search(page, keyword):
+            print("    搜索导航未到达目标 Bing 结果页，尝试首页回退")
+        else:
+            risk = _detect_search_risk(page)
+            if risk:
+                raise BrowserRiskControlError(risk)
+            random_sleep(short_range=(4, 7))
+            _random_scroll(page)
+            _random_click_result(page)
+            risk = _detect_search_risk(page)
+            if risk:
+                raise BrowserRiskControlError(risk)
+            return True
     except (BrowserRiskControlError, RiskDetectionError):
         raise
-    except Exception as e:
-        print(f"    搜索异常: {e}")
-        # 最终回退：Bing首页手动搜索
-        try:
-            safe_goto(page, BING_HOME)
-            search_box = page.locator("#sb_form_q").first
-            if search_box.count() > 0 and search_box.is_visible():
-                search_box.fill(keyword)
-                search_box.press("Enter")
-                random_sleep(short_range=(3, 6))
-        except Exception:
-            pass
+    except Exception as exc:
+        print(f"    搜索异常: {exc}")
+
+    # 最终回退：Bing 首页手动搜索；safe_goto 会吞导航异常，因此必须再次验证 URL/DOM。
+    try:
+        if not _navigate_confirmed(page, BING_HOME):
+            return False
+        search_box = page.locator("#sb_form_q").first
+        if search_box.count() > 0 and search_box.is_visible():
+            search_box.fill(keyword)
+            search_box.press("Enter")
+            random_sleep(short_range=(3, 6))
+            return _is_confirmed_bing_search(page, keyword)
+    except (BrowserRiskControlError, RiskDetectionError):
+        raise
+    except Exception as exc:
+        print(f"    搜索回退失败: {exc}")
+    return False
 
 
 def _random_scroll(page):
@@ -101,19 +206,20 @@ def _random_click_result(page):
 
 
 def do_searches(page, count: int, keywords: list, tag: str, verify=None):
-    """执行批量搜索
+    """执行批量搜索并返回明确终态。
 
     verify: 可选回调，返回当前积分余额。每4次搜索核对一次，
-    连续2次无增长（已达封顶或未计分）则提前结束。
+    连续2次无增长则提前结束。由于当前无法可靠区分积分封顶与未计分，
+    调用方必须把 SCORE_STALLED 视为未完成。
     """
+    from utils.tasks import RiskDetectionError
     if count <= 0:
         print(f"  {tag} 无需搜索")
-        return
+        return SearchOutcome(SearchStatus.COMPLETED, count, 0)
 
     if not keywords:
         print(f"  {tag} 无关键词")
-        return
-
+        return SearchOutcome(SearchStatus.NO_KEYWORDS, count, 0)
     print(f"  {tag} 搜索: {count} 次")
     cycle = _keyword_cycle(keywords)
 
@@ -122,37 +228,49 @@ def do_searches(page, count: int, keywords: list, tag: str, verify=None):
         print(f"    当前积分: {prev_score}")
     stable_checks = 0
 
-    for i in range(count):
-        keyword = next(cycle)
-        do_bing_search(page, keyword)
-        risk = _detect_search_risk(page)
-        if risk:
-            raise BrowserRiskControlError(risk)
-        if verify and (i + 1) % 4 == 0:
-            score = verify()
-            if score and prev_score and score == prev_score:
-                stable_checks += 1
-                print(f"    积分无增长({score})，连续 {stable_checks} 次")
-                if stable_checks >= 2:
-                    # 最终确认一次，避免计分延迟导致误停
-                    time.sleep(30)
-                    confirm = verify()
-                    if confirm and confirm == score:
-                        print(f"  {tag} 积分已达上限，提前结束（实际执行 {i + 1} 次）")
-                        return
+    completed = 0
+    try:
+        for i in range(count):
+            keyword = next(cycle)
+            if not do_bing_search(page, keyword):
+                print(f"  {tag} 搜索导航失败，停止本任务（已完成 {completed}/{count} 次）")
+                return SearchOutcome(SearchStatus.INTERRUPTED, count, completed)
+            completed = i + 1
+            risk = _detect_search_risk(page)
+            if risk:
+                raise BrowserRiskControlError(risk)
+            if verify and (i + 1) % 4 == 0:
+                score = verify()
+                if score and prev_score and score == prev_score:
+                    stable_checks += 1
+                    print(f"    积分无增长({score})，连续 {stable_checks} 次")
+                    if stable_checks >= 2:
+                        # 最终确认一次，避免计分延迟导致误停
+                        time.sleep(30)
+                        confirm = verify()
+                        if confirm and confirm == score:
+                            print(f"  {tag} 积分已达上限，提前结束（实际执行 {i + 1} 次）")
+                            return SearchOutcome(SearchStatus.SCORE_STALLED, count, completed)
+                        stable_checks = 0
+                        if confirm:
+                            prev_score = confirm
+                else:
                     stable_checks = 0
-                    if confirm:
-                        prev_score = confirm
-            else:
-                stable_checks = 0
-            if score:
-                prev_score = score
-        if i < count - 1:
-            delay = random.randint(15, 60)
-            if i % 5 == 0 and i > 0:
-                delay = random.randint(30, 90)
-            print(f"    进度 {i+1}/{count}, 等待{delay}s...")
-            time.sleep(delay)
+                if score:
+                    prev_score = score
+            if i < count - 1:
+                delay = random.randint(15, 60)
+                if i % 5 == 0 and i > 0:
+                    delay = random.randint(30, 90)
+                print(f"    进度 {i+1}/{count}, 等待{delay}s...")
+                time.sleep(delay)
+    except (BrowserRiskControlError, RiskDetectionError):
+        raise
+    except Exception as exc:
+        print(f"  {tag} 搜索中断: {exc}")
+        return SearchOutcome(SearchStatus.INTERRUPTED, count, completed)
+
+    return SearchOutcome(SearchStatus.COMPLETED, count, completed)
 
 
 def _keyword_cycle(words: list):

@@ -28,7 +28,13 @@ from utils.clients import (
     rewards_desktop_state,
     run_rewards_desktop_task,
 )
-from utils.browser import BrowserRiskControlError, do_searches, safe_goto
+from utils.browser import (
+    BrowserRiskControlError,
+    SearchOutcome,
+    SearchStatus,
+    do_searches,
+    safe_goto,
+)
 from utils.config import (
     BING_HOME,
     BROWSER_ENGINE,
@@ -505,15 +511,34 @@ def run_account(p, context, username: str, password: str, headless: bool, total_
         daily_done = data2.get("daily_activities_done", 0)
         daily_total = data2.get("daily_activities_total", 3)
         print(f"    活动进度: {daily_done}/{daily_total}")
-        if data2["daily_set_items"]:
-            print(f"    剩余每日任务: {len(data2['daily_set_items'])} 个")
+        daily_tasks_ok = not data2["daily_set_items"]
+        daily_activities_ok = daily_done >= daily_total
+        if not daily_tasks_ok:
+            print(f"    仍有每日任务: {len(data2['daily_set_items'])} 个")
+        if not daily_activities_ok:
+            print(f"    每日活动未完成: {daily_done}/{daily_total}")
 
         # 9. PC 搜索 — 面板无今日搜索计数（"搜索: 1/1"是打卡子任务），
         #    按每日上限次数执行（3分/次×20=60分），积分余额不增长则提前结束
+        search_ok = True
         if DEFAULT_PC_SEARCHES > 0:
             print(f"\n  --- PC 搜索 (计划{DEFAULT_PC_SEARCHES}次) ---")
             keywords = ensure_keywords(get_baidu_trends(), get_zhihu_trends(), get_weibo_trends())
-            do_searches(page, DEFAULT_PC_SEARCHES, keywords, "PC", verify=make_pc_score(page))
+            search_outcome = do_searches(
+                page, DEFAULT_PC_SEARCHES, keywords, "PC", verify=make_pc_score(page)
+            )
+            search_ok = (
+                isinstance(search_outcome, SearchOutcome)
+                and search_outcome.status is SearchStatus.COMPLETED
+                and search_outcome.completed >= DEFAULT_PC_SEARCHES
+            )
+            if not search_ok:
+                status = getattr(search_outcome, "status", "unknown")
+                completed = getattr(search_outcome, "completed", "unknown")
+                print(
+                    f"  PC 搜索未完成: 状态={status}, "
+                    f"实际 {completed}/{DEFAULT_PC_SEARCHES} 次"
+                )
         else:
             print("\n  PC 搜索已跳过")
 
@@ -594,6 +619,10 @@ def run_account(p, context, username: str, password: str, headless: bool, total_
         # 13. 最终领取
         safe_goto(page, REWARDS_DASHBOARD)
         claim_available_points(page)
+
+        if not daily_tasks_ok or not daily_activities_ok or not search_ok:
+            print("  必需任务未全部完成，账号不报告成功")
+            return False
 
         print(f"\n  账号 {username} 处理完成")
         return True
@@ -708,6 +737,9 @@ def _run(run_info: dict | None = None) -> int:
         if results and failed == len(results):
             log(f"!! 全部 {failed} 个账号均处理失败")
             return 3
+        if failed:
+            log(f"!! 部分账号处理失败（成功 {len(results) - failed}/{len(results)}）")
+            return 6
 
         log(f"所有账号处理完毕（成功 {len(results) - failed}/{len(results)}）")
         return 0

@@ -617,12 +617,12 @@ def test_main_returns_three_when_every_account_fails(monkeypatch, _stub_main_dep
     assert main_module.main() == 3
 
 
-def test_main_returns_zero_when_partial_success(monkeypatch, _stub_main_deps):
+def test_main_returns_six_when_partial_success(monkeypatch, _stub_main_deps):
     _stub_main_deps["accounts"] = [("a@example.com", "p"), ("b@example.com", "p")]
     _stub_main_deps["run_results"] = [True, False]
     _fake_playwright(monkeypatch)
     monkeypatch.setattr(main_module.sys, "argv", ["main.py"])
-    assert main_module.main() == 0
+    assert main_module.main() == 6
 
 
 def test_main_returns_two_when_temp_dir_unusable(monkeypatch, _stub_main_deps):
