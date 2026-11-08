@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from utils import accounts, browser, clients, config, dashboard, edge_streak, tasks, trends
+from utils import account_pipeline, accounts, browser, clients, config, dashboard, edge_streak, tasks, trends
 from utils.tasks import EdgeStreakResult, EdgeStreakStatus
 
 
@@ -18,6 +18,41 @@ def _never_send_real_mail_from_main(monkeypatch):
         raise AssertionError("测试不允许真的发送邮件")
 
     monkeypatch.setattr(notify, "send_mail", _boom)
+
+
+def test_main_static_reexports_account_pipeline_functions():
+    import main as main_module
+    from utils import account_pipeline
+
+    assert main_module.make_pc_score is account_pipeline.make_pc_score
+    assert main_module.run_mobile_searches is account_pipeline.run_mobile_searches
+    assert main_module.run_account is account_pipeline.run_account
+
+
+def test_launch_persistent_is_shared_between_browser_and_main():
+    import main as main_module
+    from utils import browser
+
+    assert main_module.launch_persistent is browser.launch_persistent
+
+
+def test_account_pipeline_fresh_import_has_no_cycle():
+    import sys
+
+    script = (
+        "import utils.browser;"
+        "import utils.account_pipeline;"
+        "import main;"
+        "assert main.run_account is utils.account_pipeline.run_account"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.fixture(autouse=True)
@@ -847,7 +882,7 @@ def test_run_account_risk_detection_error_returns_five(monkeypatch, tmp_path):
     monkeypatch.setattr(main_module.profile, "cleanup_stale_artifacts", lambda *a, **k: 0)
     monkeypatch.setattr(main_module.profile, "acquire_single_instance", lambda **k: Guard())
     monkeypatch.setattr(main_module, "create_context", lambda *a, **k: Context())
-    monkeypatch.setattr(main_module, "detect_risk_control", boom)
+    monkeypatch.setattr(account_pipeline, "detect_risk_control", boom)
     class Manager:
         def __enter__(self):
             return object()
@@ -3043,7 +3078,7 @@ def test_mobile_checkin_returns_success_when_already_complete(monkeypatch):
 
 
 def test_run_account_invokes_streak_tasks(monkeypatch):
-    import main as main_module
+    pipeline_module = account_pipeline
     calls = []
     class Context:
         def new_page(self):
@@ -3053,34 +3088,34 @@ def test_run_account_invokes_streak_tasks(monkeypatch):
         def goto(self, *_a, **_k): pass
         def wait_for_timeout(self, *_): pass
         def close(self): pass
-    monkeypatch.setattr(main_module, "do_login", lambda *a, **k: True)
-    monkeypatch.setattr(main_module, "ensure_account", lambda *a, **k: True)
-    monkeypatch.setattr(main_module, "safe_goto", lambda *a, **k: None)
-    monkeypatch.setattr(main_module, "detect_risk_control", lambda _p: None)
-    monkeypatch.setattr(main_module, "parse_dashboard_data", lambda _p: {
+    monkeypatch.setattr(pipeline_module, "do_login", lambda *a, **k: True)
+    monkeypatch.setattr(pipeline_module, "ensure_account", lambda *a, **k: True)
+    monkeypatch.setattr(pipeline_module, "safe_goto", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline_module, "detect_risk_control", lambda _p: None)
+    monkeypatch.setattr(pipeline_module, "parse_dashboard_data", lambda _p: {
         "claimable_points": 0, "daily_set_items": [],
         "daily_activities_done": 3, "daily_activities_total": 3,
         "pc_search_done": 0, "pc_search_total": 0,
     })
-    monkeypatch.setattr(main_module, "claim_available_points", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_daily_set_tasks", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_dashboard_activities", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_daily_offer_tasks", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_point_punch_cards", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_edge_browsing_streak_detail", lambda *a, **k: calls.append(("edge", k.get("expected_email"))) or EdgeStreakResult(EdgeStreakStatus.COMPLETED, progress=(30, 30)))
-    monkeypatch.setattr(main_module, "mobile_checkin", lambda *a, **k: calls.append("mobile") or 1)
-    monkeypatch.setattr(main_module, "run_rewards_desktop_task", lambda *a, **k: calls.append(("webview", a[0] if a else k.get("expected_email"))) or 0)
-    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.PROJECT_ROOT / "real-edge-profile")
-    monkeypatch.setattr(main_module, "DEFAULT_PC_SEARCHES", 0)
-    monkeypatch.setattr(main_module, "DEFAULT_MOBILE_SEARCHES", 0)
+    monkeypatch.setattr(pipeline_module, "claim_available_points", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_daily_set_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_dashboard_activities", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_daily_offer_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_point_punch_cards", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_edge_browsing_streak_detail", lambda *a, **k: calls.append(("edge", k.get("expected_email"))) or EdgeStreakResult(EdgeStreakStatus.COMPLETED, progress=(30, 30)))
+    monkeypatch.setattr(pipeline_module, "mobile_checkin", lambda *a, **k: calls.append("mobile") or 1)
+    monkeypatch.setattr(pipeline_module, "run_rewards_desktop_task", lambda *a, **k: calls.append(("webview", a[0] if a else k.get("expected_email"))) or 0)
+    monkeypatch.setattr(pipeline_module, "EDGE_USER_DATA_DIR", pipeline_module.USER_DATA_DIR.parent / "real-edge-profile")
+    monkeypatch.setattr(pipeline_module, "DEFAULT_PC_SEARCHES", 0)
+    monkeypatch.setattr(pipeline_module, "DEFAULT_MOBILE_SEARCHES", 0)
     # Use a minimal page factory; all real interactions are stubbed.
     ctx = type("C", (), {"new_page": lambda self: Page()})()
-    main_module.run_account(None, ctx, "u", "p", True)
+    pipeline_module.run_account(None, ctx, "u", "p", True)
     assert calls == [("edge", "u"), "mobile", ("webview", "u")]
 
 
 def _run_account_with_mobile_result(monkeypatch, mobile_result, devices, webview_result=0):
-    import main as main_module
+    pipeline_module = account_pipeline
     calls = []
     claim_calls = []
 
@@ -3096,37 +3131,37 @@ def _run_account_with_mobile_result(monkeypatch, mobile_result, devices, webview
         def close(self):
             pass
 
-    monkeypatch.setattr(main_module, "do_login", lambda *a, **k: True)
-    monkeypatch.setattr(main_module, "ensure_account", lambda *a, **k: True)
-    monkeypatch.setattr(main_module, "safe_goto", lambda *a, **k: None)
-    monkeypatch.setattr(main_module, "detect_risk_control", lambda _p: None)
-    monkeypatch.setattr(main_module, "parse_dashboard_data", lambda _p: {
+    monkeypatch.setattr(pipeline_module, "do_login", lambda *a, **k: True)
+    monkeypatch.setattr(pipeline_module, "ensure_account", lambda *a, **k: True)
+    monkeypatch.setattr(pipeline_module, "safe_goto", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline_module, "detect_risk_control", lambda _p: None)
+    monkeypatch.setattr(pipeline_module, "parse_dashboard_data", lambda _p: {
         "claimable_points": 0, "daily_set_items": [],
         "daily_activities_done": 3, "daily_activities_total": 3,
         "pc_search_done": 0, "pc_search_total": 0,
     })
-    monkeypatch.setattr(main_module, "claim_available_points", lambda *a, **k: claim_calls.append("claim") or 0)
-    monkeypatch.setattr(main_module, "do_daily_set_tasks", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_dashboard_activities", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_daily_offer_tasks", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_point_punch_cards", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_edge_browsing_streak_detail", lambda *a, **k: calls.append(("edge", k.get("expected_email"))) or EdgeStreakResult(EdgeStreakStatus.COMPLETED, progress=(30, 30)))
-    monkeypatch.setattr(main_module, "mobile_checkin", lambda *a, **k: calls.append("mobile") or mobile_result)
-    monkeypatch.setattr(main_module, "list_android_devices", lambda: devices)
-    monkeypatch.setattr(main_module, "ENABLE_MOBILE_CLIENT", True)
-    monkeypatch.setattr(main_module, "run_rewards_desktop_task", lambda *a, **k: calls.append(("webview", a[0] if a else k.get("expected_email"))) or webview_result)
-    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.PROJECT_ROOT / "real-edge-profile")
-    monkeypatch.setattr(main_module, "DEFAULT_PC_SEARCHES", 0)
-    monkeypatch.setattr(main_module, "DEFAULT_MOBILE_SEARCHES", 0)
+    monkeypatch.setattr(pipeline_module, "claim_available_points", lambda *a, **k: claim_calls.append("claim") or 0)
+    monkeypatch.setattr(pipeline_module, "do_daily_set_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_dashboard_activities", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_daily_offer_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_point_punch_cards", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_edge_browsing_streak_detail", lambda *a, **k: calls.append(("edge", k.get("expected_email"))) or EdgeStreakResult(EdgeStreakStatus.COMPLETED, progress=(30, 30)))
+    monkeypatch.setattr(pipeline_module, "mobile_checkin", lambda *a, **k: calls.append("mobile") or mobile_result)
+    monkeypatch.setattr(pipeline_module, "list_android_devices", lambda: devices)
+    monkeypatch.setattr(pipeline_module, "ENABLE_MOBILE_CLIENT", True)
+    monkeypatch.setattr(pipeline_module, "run_rewards_desktop_task", lambda *a, **k: calls.append(("webview", a[0] if a else k.get("expected_email"))) or webview_result)
+    monkeypatch.setattr(pipeline_module, "EDGE_USER_DATA_DIR", pipeline_module.USER_DATA_DIR.parent / "real-edge-profile")
+    monkeypatch.setattr(pipeline_module, "DEFAULT_PC_SEARCHES", 0)
+    monkeypatch.setattr(pipeline_module, "DEFAULT_MOBILE_SEARCHES", 0)
     ctx = type("C", (), {"new_page": lambda self: Page()})()
-    return main_module.run_account(None, ctx, "u", "p", True), calls, claim_calls
+    return pipeline_module.run_account(None, ctx, "u", "p", True), calls, claim_calls
 
 
 def _run_account_with_dashboard_checks(
     monkeypatch, *, final_dashboard, search_status_name, search_completed,
     requested_searches=3,
 ):
-    import main as main_module
+    pipeline_module = account_pipeline
 
     calls = {"claim": 0, "search": 0, "mobile": 0, "webview": 0}
     initial_dashboard = {
@@ -3149,20 +3184,20 @@ def _run_account_with_dashboard_checks(
         def new_page(self):
             return Page()
 
-    monkeypatch.setattr(main_module, "do_login", lambda *a, **k: True)
-    monkeypatch.setattr(main_module, "ensure_account", lambda *a, **k: True)
-    monkeypatch.setattr(main_module, "safe_goto", lambda *a, **k: None)
-    monkeypatch.setattr(main_module, "detect_risk_control", lambda _p: None)
-    monkeypatch.setattr(main_module, "parse_dashboard_data", lambda _p: next(dashboard_results))
+    monkeypatch.setattr(pipeline_module, "do_login", lambda *a, **k: True)
+    monkeypatch.setattr(pipeline_module, "ensure_account", lambda *a, **k: True)
+    monkeypatch.setattr(pipeline_module, "safe_goto", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline_module, "detect_risk_control", lambda _p: None)
+    monkeypatch.setattr(pipeline_module, "parse_dashboard_data", lambda _p: next(dashboard_results))
     monkeypatch.setattr(
-        main_module,
+        pipeline_module,
         "claim_available_points",
         lambda *a, **k: calls.__setitem__("claim", calls["claim"] + 1) or 0,
     )
-    monkeypatch.setattr(main_module, "do_daily_set_tasks", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_dashboard_activities", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_daily_offer_tasks", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_point_punch_cards", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_daily_set_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_dashboard_activities", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_daily_offer_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_point_punch_cards", lambda *a, **k: 0)
 
     def fake_searches(*_a, **_k):
         calls["search"] += 1
@@ -3173,24 +3208,24 @@ def _run_account_with_dashboard_checks(
             completed=search_completed,
         )
 
-    monkeypatch.setattr(main_module, "do_searches", fake_searches)
-    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.USER_DATA_DIR)
-    monkeypatch.setattr(main_module, "DEFAULT_PC_SEARCHES", requested_searches)
-    monkeypatch.setattr(main_module, "DEFAULT_MOBILE_SEARCHES", 0)
+    monkeypatch.setattr(pipeline_module, "do_searches", fake_searches)
+    monkeypatch.setattr(pipeline_module, "EDGE_USER_DATA_DIR", pipeline_module.USER_DATA_DIR)
+    monkeypatch.setattr(pipeline_module, "DEFAULT_PC_SEARCHES", requested_searches)
+    monkeypatch.setattr(pipeline_module, "DEFAULT_MOBILE_SEARCHES", 0)
     monkeypatch.setattr(
-        main_module,
+        pipeline_module,
         "mobile_checkin",
         lambda *a, **k: calls.__setitem__("mobile", calls["mobile"] + 1) or 1,
     )
-    monkeypatch.setattr(main_module, "list_android_devices", lambda: [])
+    monkeypatch.setattr(pipeline_module, "list_android_devices", lambda: [])
     monkeypatch.setattr(
-        main_module,
+        pipeline_module,
         "run_rewards_desktop_task",
         lambda *a, **k: calls.__setitem__("webview", calls["webview"] + 1)
         or clients.REWARDS_DESKTOP_NO_TASK,
     )
 
-    result = main_module.run_account(None, Context(), "u", "p", True)
+    result = pipeline_module.run_account(None, Context(), "u", "p", True)
     return result, calls
 
 
@@ -3383,34 +3418,34 @@ def test_run_account_succeeds_when_webview_task_grows(monkeypatch):
 
 
 def test_run_account_skips_edge_streak_on_isolation_profile(monkeypatch):
-    import main as main_module
+    pipeline_module = account_pipeline
     calls = []
     class Page:
         url = "https://rewards.bing.com/dashboard"
         def goto(self, *_a, **_k): pass
         def wait_for_timeout(self, *_): pass
         def close(self): pass
-    monkeypatch.setattr(main_module, "ensure_account", lambda *a, **k: True)
-    monkeypatch.setattr(main_module, "safe_goto", lambda *a, **k: None)
-    monkeypatch.setattr(main_module, "detect_risk_control", lambda _p: None)
-    monkeypatch.setattr(main_module, "parse_dashboard_data", lambda _p: {
+    monkeypatch.setattr(pipeline_module, "ensure_account", lambda *a, **k: True)
+    monkeypatch.setattr(pipeline_module, "safe_goto", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline_module, "detect_risk_control", lambda _p: None)
+    monkeypatch.setattr(pipeline_module, "parse_dashboard_data", lambda _p: {
         "claimable_points": 0, "daily_set_items": [],
         "daily_activities_done": 3, "daily_activities_total": 3,
         "pc_search_done": 0, "pc_search_total": 0,
     })
-    monkeypatch.setattr(main_module, "claim_available_points", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_daily_set_tasks", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_dashboard_activities", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_daily_offer_tasks", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_point_punch_cards", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_edge_browsing_streak_detail", lambda *a, **k: calls.append("edge") or EdgeStreakResult(EdgeStreakStatus.COMPLETED, progress=(30, 30)))
-    monkeypatch.setattr(main_module, "mobile_checkin", lambda *a, **k: calls.append("mobile") or 1)
-    monkeypatch.setattr(main_module, "run_rewards_desktop_task", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.USER_DATA_DIR)
-    monkeypatch.setattr(main_module, "DEFAULT_PC_SEARCHES", 0)
-    monkeypatch.setattr(main_module, "DEFAULT_MOBILE_SEARCHES", 0)
+    monkeypatch.setattr(pipeline_module, "claim_available_points", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_daily_set_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_dashboard_activities", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_daily_offer_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_point_punch_cards", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_edge_browsing_streak_detail", lambda *a, **k: calls.append("edge") or EdgeStreakResult(EdgeStreakStatus.COMPLETED, progress=(30, 30)))
+    monkeypatch.setattr(pipeline_module, "mobile_checkin", lambda *a, **k: calls.append("mobile") or 1)
+    monkeypatch.setattr(pipeline_module, "run_rewards_desktop_task", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "EDGE_USER_DATA_DIR", pipeline_module.USER_DATA_DIR)
+    monkeypatch.setattr(pipeline_module, "DEFAULT_PC_SEARCHES", 0)
+    monkeypatch.setattr(pipeline_module, "DEFAULT_MOBILE_SEARCHES", 0)
     ctx = type("C", (), {"new_page": lambda self: Page()})()
-    main_module.run_account(None, ctx, "u", "p", True)
+    pipeline_module.run_account(None, ctx, "u", "p", True)
     assert calls == ["mobile"]
 
 
@@ -3426,7 +3461,7 @@ def test_run_account_skips_edge_streak_on_isolation_profile(monkeypatch):
 def test_run_account_edge_identity_failure_cannot_be_overridden_by_30_30(
     monkeypatch, capsys, edge_status, message
 ):
-    import main as main_module
+    pipeline_module = account_pipeline
 
     class Page:
         url = "https://rewards.bing.com/dashboard"
@@ -3440,37 +3475,37 @@ def test_run_account_edge_identity_failure_cannot_be_overridden_by_30_30(
         def close(self):
             pass
 
-    monkeypatch.setattr(main_module, "ensure_account", lambda *a, **k: True)
-    monkeypatch.setattr(main_module, "safe_goto", lambda *a, **k: None)
-    monkeypatch.setattr(main_module, "detect_risk_control", lambda _p: None)
-    monkeypatch.setattr(main_module, "parse_dashboard_data", lambda _p: {
+    monkeypatch.setattr(pipeline_module, "ensure_account", lambda *a, **k: True)
+    monkeypatch.setattr(pipeline_module, "safe_goto", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline_module, "detect_risk_control", lambda _p: None)
+    monkeypatch.setattr(pipeline_module, "parse_dashboard_data", lambda _p: {
         "claimable_points": 0, "daily_set_items": [],
         "daily_activities_done": 3, "daily_activities_total": 3,
         "pc_search_done": 0, "pc_search_total": 0,
     })
-    monkeypatch.setattr(main_module, "claim_available_points", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_daily_set_tasks", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_dashboard_activities", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_daily_offer_tasks", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_point_punch_cards", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "claim_available_points", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_daily_set_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_dashboard_activities", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_daily_offer_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_point_punch_cards", lambda *a, **k: 0)
     monkeypatch.setattr(
-        main_module,
+        pipeline_module,
         "do_edge_browsing_streak_detail",
         lambda *a, **k: EdgeStreakResult(edge_status, progress=(30, 30)),
     )
-    monkeypatch.setattr(main_module, "read_streak_progress", lambda *a, **k: (30, 30))
-    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.PROJECT_ROOT / "real-edge-profile")
-    monkeypatch.setattr(main_module, "DEFAULT_PC_SEARCHES", 0)
-    monkeypatch.setattr(main_module, "DEFAULT_MOBILE_SEARCHES", 0)
+    monkeypatch.setattr(pipeline_module, "read_streak_progress", lambda *a, **k: (30, 30))
+    monkeypatch.setattr(pipeline_module, "EDGE_USER_DATA_DIR", pipeline_module.USER_DATA_DIR.parent / "real-edge-profile")
+    monkeypatch.setattr(pipeline_module, "DEFAULT_PC_SEARCHES", 0)
+    monkeypatch.setattr(pipeline_module, "DEFAULT_MOBILE_SEARCHES", 0)
     ctx = type("C", (), {"new_page": lambda self: Page()})()
 
-    assert main_module.run_account(None, ctx, "u", "p", True) is False
+    assert pipeline_module.run_account(None, ctx, "u", "p", True) is False
     assert message in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("invalid_progress", [(31, 30), (-1, 30), (0, 0), (1, 0)])
 def test_run_account_rejects_invalid_edge_recheck_progress(monkeypatch, invalid_progress):
-    import main as main_module
+    pipeline_module = account_pipeline
 
     class Page:
         url = "https://rewards.bing.com/dashboard"
@@ -3478,63 +3513,63 @@ def test_run_account_rejects_invalid_edge_recheck_progress(monkeypatch, invalid_
         def wait_for_timeout(self, *_): pass
         def close(self): pass
 
-    monkeypatch.setattr(main_module, "ensure_account", lambda *a, **k: True)
-    monkeypatch.setattr(main_module, "safe_goto", lambda *a, **k: None)
-    monkeypatch.setattr(main_module, "detect_risk_control", lambda _p: None)
-    monkeypatch.setattr(main_module, "parse_dashboard_data", lambda _p: {
+    monkeypatch.setattr(pipeline_module, "ensure_account", lambda *a, **k: True)
+    monkeypatch.setattr(pipeline_module, "safe_goto", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline_module, "detect_risk_control", lambda _p: None)
+    monkeypatch.setattr(pipeline_module, "parse_dashboard_data", lambda _p: {
         "claimable_points": 0, "daily_set_items": [],
         "daily_activities_done": 3, "daily_activities_total": 3,
         "pc_search_done": 0, "pc_search_total": 0,
     })
-    monkeypatch.setattr(main_module, "claim_available_points", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_daily_set_tasks", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_dashboard_activities", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_daily_offer_tasks", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_point_punch_cards", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "claim_available_points", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_daily_set_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_dashboard_activities", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_daily_offer_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_point_punch_cards", lambda *a, **k: 0)
     monkeypatch.setattr(
-        main_module,
+        pipeline_module,
         "do_edge_browsing_streak_detail",
         lambda *a, **k: EdgeStreakResult(EdgeStreakStatus.INCOMPLETE, progress=(10, 30)),
     )
-    monkeypatch.setattr(main_module, "read_streak_progress", lambda *a, **k: invalid_progress)
-    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.PROJECT_ROOT / "real-edge-profile")
-    monkeypatch.setattr(main_module, "DEFAULT_PC_SEARCHES", 0)
-    monkeypatch.setattr(main_module, "DEFAULT_MOBILE_SEARCHES", 0)
+    monkeypatch.setattr(pipeline_module, "read_streak_progress", lambda *a, **k: invalid_progress)
+    monkeypatch.setattr(pipeline_module, "EDGE_USER_DATA_DIR", pipeline_module.USER_DATA_DIR.parent / "real-edge-profile")
+    monkeypatch.setattr(pipeline_module, "DEFAULT_PC_SEARCHES", 0)
+    monkeypatch.setattr(pipeline_module, "DEFAULT_MOBILE_SEARCHES", 0)
     ctx = type("C", (), {"new_page": lambda self: Page()})()
 
-    assert main_module.run_account(None, ctx, "u", "p", True) is False
+    assert pipeline_module.run_account(None, ctx, "u", "p", True) is False
 
 
 def test_run_account_returns_false_when_edge_streak_incomplete(monkeypatch):
-    import main as main_module
+    pipeline_module = account_pipeline
     class Page:
         url = "https://rewards.bing.com/dashboard"
         def goto(self, *_a, **_k): pass
         def wait_for_timeout(self, *_): pass
         def close(self): pass
-    monkeypatch.setattr(main_module, "safe_goto", lambda *a, **k: None)
-    monkeypatch.setattr(main_module, "detect_risk_control", lambda _p: None)
-    monkeypatch.setattr(main_module, "parse_dashboard_data", lambda _p: {
+    monkeypatch.setattr(pipeline_module, "safe_goto", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline_module, "detect_risk_control", lambda _p: None)
+    monkeypatch.setattr(pipeline_module, "parse_dashboard_data", lambda _p: {
         "claimable_points": 0, "daily_set_items": [],
         "daily_activities_done": 3, "daily_activities_total": 3,
         "pc_search_done": 0, "pc_search_total": 0,
     })
-    monkeypatch.setattr(main_module, "claim_available_points", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_daily_set_tasks", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_dashboard_activities", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_daily_offer_tasks", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_point_punch_cards", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_edge_browsing_streak_detail", lambda *a, **k: EdgeStreakResult(EdgeStreakStatus.INCOMPLETE, progress=(10, 30)))
-    monkeypatch.setattr(main_module, "read_streak_progress", lambda *a, **k: (10, 30))
-    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.PROJECT_ROOT / "real-edge-profile")
-    monkeypatch.setattr(main_module, "DEFAULT_PC_SEARCHES", 0)
-    monkeypatch.setattr(main_module, "DEFAULT_MOBILE_SEARCHES", 0)
+    monkeypatch.setattr(pipeline_module, "claim_available_points", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_daily_set_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_dashboard_activities", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_daily_offer_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_point_punch_cards", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline_module, "do_edge_browsing_streak_detail", lambda *a, **k: EdgeStreakResult(EdgeStreakStatus.INCOMPLETE, progress=(10, 30)))
+    monkeypatch.setattr(pipeline_module, "read_streak_progress", lambda *a, **k: (10, 30))
+    monkeypatch.setattr(pipeline_module, "EDGE_USER_DATA_DIR", pipeline_module.USER_DATA_DIR.parent / "real-edge-profile")
+    monkeypatch.setattr(pipeline_module, "DEFAULT_PC_SEARCHES", 0)
+    monkeypatch.setattr(pipeline_module, "DEFAULT_MOBILE_SEARCHES", 0)
     ctx = type("C", (), {"new_page": lambda self: Page()})()
-    assert main_module.run_account(None, ctx, "u", "p", True) is False
+    assert pipeline_module.run_account(None, ctx, "u", "p", True) is False
 
 
 def test_run_account_rechecks_identity_after_login(monkeypatch):
-    import main as main_module
+    pipeline_module = account_pipeline
     calls = []
     class Page:
         url = "https://login.live.com/login.srf"
@@ -3543,12 +3578,12 @@ def test_run_account_rechecks_identity_after_login(monkeypatch):
         def close(self): pass
     class LoggedInPage(Page):
         url = "https://rewards.bing.com/dashboard"
-    monkeypatch.setattr(main_module, "safe_goto", lambda *a, **k: None)
-    monkeypatch.setattr(main_module, "detect_risk_control", lambda _p: None)
-    monkeypatch.setattr(main_module, "do_login", lambda *a, **k: True)
-    monkeypatch.setattr(main_module, "ensure_account", lambda *a, **k: calls.append("identity") or False)
+    monkeypatch.setattr(pipeline_module, "safe_goto", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline_module, "detect_risk_control", lambda _p: None)
+    monkeypatch.setattr(pipeline_module, "do_login", lambda *a, **k: True)
+    monkeypatch.setattr(pipeline_module, "ensure_account", lambda *a, **k: calls.append("identity") or False)
     ctx = type("C", (), {"new_page": lambda self: LoggedInPage()})()
-    assert main_module.run_account(None, ctx, "target@example.com", "pw", True) is False
+    assert pipeline_module.run_account(None, ctx, "target@example.com", "pw", True) is False
     assert calls == ["identity"]
 
 

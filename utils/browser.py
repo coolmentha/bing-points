@@ -8,6 +8,21 @@ from urllib.parse import parse_qs, quote_plus, urlsplit
 from utils.config import BING_HOME
 
 
+def launch_persistent(p, user_data_dir, headless: bool, use_edge: bool, **extra):
+    """启动持久化上下文；use_edge=False 被禁止，防止静默启动 Chromium。"""
+    if not use_edge:
+        raise SystemExit("仅允许 Edge 启动，已禁止 Chromium 回退")
+    kwargs = dict(
+        user_data_dir=str(user_data_dir),
+        headless=headless,
+        args=["--disable-blink-features=AutomationControlled"],
+        locale="zh-CN",
+    )
+    kwargs["channel"] = "msedge"
+    kwargs.update(extra)
+    return p.chromium.launch_persistent_context(**kwargs)
+
+
 class BrowserRiskControlError(RuntimeError):
     """搜索中出现微软验证码或限制页时停止当前账号。"""
 
