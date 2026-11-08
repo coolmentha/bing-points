@@ -18,7 +18,13 @@ from playwright.sync_api import sync_playwright
 
 from utils import profile
 from utils.accounts import load_accounts
-from utils.clients import mobile_checkin, rewards_desktop_state, run_rewards_desktop_task
+from utils.clients import (
+    list_android_devices,
+    mobile_checkin,
+    REWARDS_DESKTOP_UIA_UNAVAILABLE,
+    rewards_desktop_state,
+    run_rewards_desktop_task,
+)
 from utils.browser import BrowserRiskControlError, do_searches, safe_goto
 from utils.config import (
     BING_HOME,
@@ -26,7 +32,7 @@ from utils.config import (
     DEFAULT_MOBILE_SEARCHES,
     DEFAULT_PC_SEARCHES,
     EDGE_USER_DATA_DIR,
-    LOG_DIR,
+    ENABLE_MOBILE_CLIENT,
     MOBILE_PROFILE_DIR,
     MOBILE_USER_AGENT,
     PROJECT_ROOT,
@@ -401,7 +407,7 @@ def run_account(p, context, username: str, password: str, headless: bool, total_
         if not needs_login:
             # 正式 Edge profile 往往已登录；必须确认是目标账号，不能直接操作。
             if not ensure_account(page, username, password):
-                print("  当前账号不是目标账号，切换登录失败，跳过")
+                print("  账号身份校验失败，跳过")
                 return False
             safe_goto(page, REWARDS_DASHBOARD, wait_extra=4000)
 
@@ -533,16 +539,24 @@ def run_account(p, context, username: str, password: str, headless: bool, total_
 
         print("\n  --- 必应应用签到（Android 模拟器） ---")
         mobile_result = mobile_checkin(username)
-        if mobile_result != 1 and total_accounts == 1:
-            print("  必应应用签到未确认，账号不报告成功")
-            return False
-        if mobile_result != 1 and total_accounts > 1:
-            print("  多账号下移动 App 未确认目标身份，本账号不报告 App 签到")
+        if mobile_result != 1:
+            if not ENABLE_MOBILE_CLIENT:
+                print("  必应移动客户端已禁用，跳过必应应用签到")
+            elif not list_android_devices():
+                print("  未连接 Android 设备，跳过必应应用签到")
+            elif total_accounts == 1:
+                print("  必应应用签到未确认，账号不报告成功")
+                return False
+            else:
+                print("  多账号下移动 App 未确认目标身份，本账号不报告 App 签到")
 
-        # 12.5 无启用任务可正常跳过；UIA 异常才算失败。
+        # 12.5 无启用任务可正常跳过；UIA 环境不可用不覆盖其他任务成功。
         print("\n  --- Rewards 桌面 WebView ---")
-        if run_rewards_desktop_task() < 0:
-            print("  Rewards 桌面 WebView 运行异常，账号不报告成功")
+        webview_status = run_rewards_desktop_task()
+        if webview_status == REWARDS_DESKTOP_UIA_UNAVAILABLE:
+            print("  WebView UIA 不可用，跳过（不影响其他任务）")
+        elif webview_status < 0:
+            print("  Rewards 桌面 WebView 任务执行失败，账号不报告成功")
             return False
 
         # 13. 最终领取
@@ -568,143 +582,180 @@ def run_account(p, context, username: str, password: str, headless: bool, total_
 
 
 def _resolve_log_path():
-    """定位本次运行的日志文件，供失败推送附带日志尾部。
+    """返回 start.bat 传入的本次日志路径。
 
-    优先用 start.bat 传进来的确切路径（BING_REWARDS_LOG_FILE）；直接
-    python main.py 运行时没有该变量，则回退到 logs/ 下最新的 run_*.log。
+    不能回退到 logs/ 下最新文件：旧实例发通知时，新实例可能已经创建了
+    更新的日志，猜测会把新任务的日志误附到旧通知中。未显式传入时返回
+    None，由通知正文明确标注“未知”。
     """
     explicit = os.getenv("BING_REWARDS_LOG_FILE")
-    if explicit:
-        return explicit
-    try:
-        candidates = sorted(
-            LOG_DIR.glob("run_*.log"),
-            key=lambda x: x.stat().st_mtime,
-            reverse=True,
-        )
-        return candidates[0] if candidates else None
-    except Exception:
-        return None
+    return explicit if explicit else None
 
 
-def _run() -> int:
+def _run(run_info: dict | None = None) -> int:
+    """执行一次运行；失败通知完成前始终持有单实例锁。"""
+    run_info = run_info or _capture_run_info(datetime.now())
+
     def log(message: str) -> None:
         # 无人值守运行时没有可见窗口，stdout 由 start.bat 重定向到 logs/run_*.log
         print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}", flush=True)
 
-    log("启动 Bing Rewards 自动化 (Playwright)!")
-    log(f"pid={os.getpid()} cwd={os.getcwd()} argv={sys.argv[1:]}")
-    log(_log_session())
-
-    headless = False
-    # --task 由 start.bat 传入，仅用于标记“无人值守启动”，此处忽略
-    flags = [arg.strip().lower() for arg in sys.argv[1:] if arg.strip().lower() != "--task"]
-    if flags and flags[0] in ("headless", "--headless", "-h"):
-        headless = True
-
-    try:
-        accounts = load_accounts()
-    except Exception as exc:
-        log(f"!! 读取账号失败: {exc}")
-        return 4
-    log(f"账号数量: {len(accounts)}")
-
-    # 临时目录必须在 sync_playwright() 之前固定：驱动进程在启动时继承 TEMP，
-    # 之后再改环境变量对它无效（系统 %TEMP% 不可写会抛 mkdtemp EPERM）
-    profile.prepare_temp_dir(TEMP_DIR)
-    if not profile.warmup_temp_dir(TEMP_DIR):
-        log(f"!! 临时目录不可写: {TEMP_DIR}")
-        log("   Playwright 需要在该目录创建临时文件夹，请检查目录权限或安全软件拦截。")
-        return 2
-    stale = profile.cleanup_stale_artifacts(TEMP_DIR)
-    if stale:
-        log(f"已清理 {stale} 个遗留的 Playwright 临时目录")
-
-    # 单实例保护：两个实例共用同一 profile 只会互相抢占，第二个直接退出
     guard = None
-    if not os.getenv("BING_REWARDS_ALLOW_MULTI"):
-        guard = profile.acquire_single_instance()
-        if guard is None:
-            log("!! 已有另一个 bing-points 实例在运行（共用同一浏览器 profile）")
-            log("   并发运行会互相抢占 profile 导致启动失败，本次退出。")
-            log("   如确实需要并行，请设置环境变量 BING_REWARDS_ALLOW_MULTI=1（并使用不同 profile）")
-            return 0
 
-    results: list[bool] = []
+    def execute() -> int:
+        nonlocal guard
+        log("启动 Bing Rewards 自动化 (Playwright)!")
+        log(f"pid={os.getpid()} cwd={os.getcwd()} argv={sys.argv[1:]}")
+        log(_log_session())
+        if run_info.get("log_path"):
+            log(f"本次运行日志: {run_info['log_path']}")
+
+        headless = False
+        # --task 由 start.bat 传入，仅用于标记“无人值守启动”，此处忽略
+        flags = [arg.strip().lower() for arg in sys.argv[1:] if arg.strip().lower() != "--task"]
+        if flags and flags[0] in ("headless", "--headless", "-h"):
+            headless = True
+
+        try:
+            accounts = load_accounts()
+        except Exception as exc:
+            log(f"!! 读取账号失败: {exc}")
+            return 4
+        log(f"账号数量: {len(accounts)}")
+
+        # 临时目录必须在 sync_playwright() 之前固定：驱动进程在启动时继承 TEMP，
+        # 之后再改环境变量对它无效（系统 %TEMP% 不可写会抛 mkdtemp EPERM）
+        profile.prepare_temp_dir(TEMP_DIR)
+        if not profile.warmup_temp_dir(TEMP_DIR):
+            log(f"!! 临时目录不可写: {TEMP_DIR}")
+            log("   Playwright 需要在该目录创建临时文件夹，请检查目录权限或安全软件拦截。")
+            return 2
+        stale = profile.cleanup_stale_artifacts(TEMP_DIR)
+        if stale:
+            log(f"已清理 {stale} 个遗留的 Playwright 临时目录")
+
+        # 单实例保护：两个实例共用同一 profile 只会互相抢占，第二个直接退出
+        if not os.getenv("BING_REWARDS_ALLOW_MULTI"):
+            guard = profile.acquire_single_instance()
+            if guard is None:
+                log("!! 已有另一个 bing-points 实例在运行（共用同一浏览器 profile）")
+                log("   并发运行会互相抢占 profile 导致启动失败，本次退出。")
+                log("   如确实需要并行，请设置环境变量 BING_REWARDS_ALLOW_MULTI=1（并使用不同 profile）")
+                return 0
+
+        results: list[bool] = []
+        try:
+            with sync_playwright() as p:
+                log("启动浏览器上下文...")
+                context = create_context(p, headless)
+                log("浏览器已启动，进入账号循环")
+                # 注入反检测脚本
+                context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+                    window.chrome = { runtime: {} };
+                    Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                    Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN','zh','en'] });
+                """)
+
+                try:
+                    for idx, (username, password) in enumerate(accounts, 1):
+                        log(f"账号 {idx}/{len(accounts)} 开始")
+                        results.append(run_account(p, context, username, password, headless, len(accounts)))
+                        log(f"账号 {idx}/{len(accounts)} 结束")
+                finally:
+                    context.close()
+                    log("浏览器上下文已关闭")
+        except RiskDetectionError as exc:
+            log(f"!! 风控检测失败，停止运行: {exc}")
+            return 5
+        except SystemExit as exc:
+            log(f"!! 启动阶段终止，退出码 {exc.code}")
+            return int(exc.code or 1)
+
+        failed = results.count(False)
+        if results and failed == len(results):
+            log(f"!! 全部 {failed} 个账号均处理失败")
+            return 3
+
+        log(f"所有账号处理完毕（成功 {len(results) - failed}/{len(results)}）")
+        return 0
+
+    exit_code = 1
     try:
-        with sync_playwright() as p:
-            log("启动浏览器上下文...")
-            context = create_context(p, headless)
-            log("浏览器已启动，进入账号循环")
-            # 注入反检测脚本
-            context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => false });
-                window.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN','zh','en'] });
-            """)
+        try:
+            exit_code = execute()
+        except RiskDetectionError as exc:
+            log(f"!! 风控检测失败，停止运行: {exc}")
+            exit_code = 5
+        except Exception:
+            import traceback
 
-            try:
-                for idx, (username, password) in enumerate(accounts, 1):
-                    log(f"账号 {idx}/{len(accounts)} 开始")
-                    results.append(run_account(p, context, username, password, headless, len(accounts)))
-                    log(f"账号 {idx}/{len(accounts)} 结束")
-            finally:
-                context.close()
-                log("浏览器上下文已关闭")
-    except RiskDetectionError as exc:
-        log(f"!! 风控检测失败，停止运行: {exc}")
-        return 5
-    except SystemExit as exc:
-        log(f"!! 启动阶段终止，退出码 {exc.code}")
-        return int(exc.code or 1)
+            traceback.print_exc()
+            exit_code = 1
     finally:
+        # 通知必须在 guard.close() 之前完成，避免旧通知发送期间新实例启动。
+        _notify_failure(exit_code, run_info)
         if guard is not None:
             guard.close()
+    return exit_code
 
-    failed = results.count(False)
-    if results and failed == len(results):
-        log(f"!! 全部 {failed} 个账号均处理失败")
-        return 3
 
-    log(f"所有账号处理完毕（成功 {len(results) - failed}/{len(results)}）")
-    return 0
+def _log_mtime(log_path: str) -> str:
+    try:
+        from pathlib import Path
+
+        path = Path(log_path)
+        if path.exists():
+            return datetime.fromtimestamp(path.stat().st_mtime).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+    except Exception:
+        pass
+    return "未知"
+
+
+def _capture_run_info(started_at: datetime) -> dict:
+    """采集本次运行的稳定身份，供失败通知定位日志。"""
+    log_path = _resolve_log_path()
+    info = {
+        "pid": os.getpid(),
+        "log_path": log_path or "未知",
+        "started_at": started_at.strftime("%Y-%m-%d %H:%M:%S"),
+        "log_mtime": "未知",
+    }
+    if log_path:
+        info["log_mtime"] = _log_mtime(log_path)
+    return info
+
+
+def _notify_failure(exit_code: int, run_info: dict) -> None:
+    """在单实例锁释放前尽最大努力发送失败通知。"""
+    if exit_code == 0:
+        return
+    try:
+        from utils.notify import RunLog, notify_failure, read_log_tail
+
+        log_path = run_info.get("log_path")
+        if log_path and log_path != "未知":
+            run_info["log_mtime"] = _log_mtime(log_path)
+            log_text = read_log_tail(log_path)
+        else:
+            log_text = ""
+        notify_failure(exit_code, RunLog(log_text, run_info=run_info))
+    except Exception:
+        # 通知是尽最大努力：绝不允许它改变运行结果或吞掉原退出码
+        try:
+            print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [推送] 推送流程异常（已忽略）")
+            import traceback
+
+            traceback.print_exc()
+        except Exception:
+            pass
 
 
 def main() -> int:
-    """入口：跑完业务流程后，失败时推送通知。
-
-    推送放在最外层，保证任何失败路径（启动失败/账号全败/配置读不到）
-    都会被推送覆盖，而推送自身的异常不会影响退出码。
-    """
-    try:
-        exit_code = _run()
-    except RiskDetectionError as exc:
-        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] 风控检测失败，停止运行: {exc}")
-        exit_code = 5
-    except Exception:
-        import traceback
-
-        traceback.print_exc()
-        exit_code = 1
-
-    if exit_code != 0:
-        try:
-            from utils.notify import notify_failure, read_log_tail
-
-            log_path = _resolve_log_path()
-            notify_failure(exit_code, read_log_tail(log_path))
-        except Exception:
-            # 通知是尽最大努力：绝不允许它改变运行结果或吞掉原退出码
-            try:
-                print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [推送] 推送流程异常（已忽略）")
-                import traceback
-
-                traceback.print_exc()
-            except Exception:
-                pass
-
-    return exit_code
+    """入口：通知生命周期由 _run 与单实例锁共同覆盖。"""
+    return _run(_capture_run_info(datetime.now()))
 
 
 if __name__ == "__main__":

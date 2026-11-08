@@ -1,9 +1,41 @@
+import json
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from utils import accounts, browser, clients, config, dashboard, tasks, trends
+
+
+@pytest.fixture(autouse=True)
+def _never_send_real_mail_from_main(monkeypatch):
+    """main/_run 现在会自动通知；测试绝不能连接真实 SMTP。"""
+    from utils import notify
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("测试不允许真的发送邮件")
+
+    monkeypatch.setattr(notify, "send_mail", _boom)
+
+
+@pytest.fixture(autouse=True)
+def edge_browser_logged_in(tmp_path_factory, monkeypatch):
+    """Edge 打卡行为测试默认使用已登录的临时 profile。"""
+    root = tmp_path_factory.mktemp("synthetic_edge_user_data")
+    profile = root / "Default"
+    profile.mkdir()
+    (profile / "Preferences").write_text("{}", encoding="utf-8")
+    (root / "Local State").write_text(
+        json.dumps({
+            "profile": {
+                "info_cache": {
+                    "Default": {"user_name": "synthetic@example.invalid"}
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(tasks, "EDGE_USER_DATA_DIR", root)
 
 
 # ======================== 账号管理 ========================
@@ -756,6 +788,233 @@ def test_run_account_risk_detection_error_returns_five(monkeypatch, tmp_path):
     assert main_module._run() == 5
 
 
+def _stub_main_run_for_notifications(
+    monkeypatch, *, run_results=(False,), allow_multi=True, guard=None
+):
+    import main as main_module
+
+    state = {"run_results": list(run_results)}
+    monkeypatch.setattr(main_module, "load_accounts", lambda: [("u@example.com", "p")])
+    monkeypatch.setattr(
+        main_module, "run_account", lambda *a, **k: state["run_results"].pop(0)
+    )
+    monkeypatch.setattr(main_module.profile, "prepare_temp_dir", lambda *a, **k: None)
+    monkeypatch.setattr(main_module.profile, "warmup_temp_dir", lambda *a, **k: True)
+    monkeypatch.setattr(main_module.profile, "cleanup_stale_artifacts", lambda *a, **k: 0)
+    if allow_multi:
+        monkeypatch.setenv("BING_REWARDS_ALLOW_MULTI", "1")
+        monkeypatch.setattr(main_module.profile, "acquire_single_instance", lambda **k: guard)
+    else:
+        monkeypatch.delenv("BING_REWARDS_ALLOW_MULTI", raising=False)
+        monkeypatch.setattr(main_module.profile, "acquire_single_instance", lambda **k: guard)
+
+    class Context:
+        def add_init_script(self, _script):
+            return None
+
+        def close(self):
+            return None
+
+    class Manager:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(main_module, "sync_playwright", lambda: Manager())
+    monkeypatch.setattr(main_module, "create_context", lambda *a, **k: Context())
+    monkeypatch.setattr(main_module.sys, "argv", ["main.py"])
+    return main_module
+
+
+def test_failure_notification_is_sent_before_single_instance_guard_close(monkeypatch):
+    events = []
+
+    class Guard:
+        def close(self):
+            events.append("guard.close")
+
+    main_module = _stub_main_run_for_notifications(
+        monkeypatch, allow_multi=False, guard=Guard()
+    )
+    from utils import notify
+
+    monkeypatch.setattr(
+        notify,
+        "notify_failure",
+        lambda *a, **k: events.append("notify") or True,
+    )
+
+    assert main_module.main() == 3
+    assert events == ["notify", "guard.close"]
+
+
+def test_main_sends_failure_notification_once(monkeypatch):
+    main_module = _stub_main_run_for_notifications(monkeypatch)
+    from utils import notify
+
+    calls = []
+    monkeypatch.setattr(notify, "notify_failure", lambda *a, **k: calls.append(a) or True)
+
+    assert main_module.main() == 3
+    assert len(calls) == 1
+    assert calls[0][0] == 3
+
+
+def test_main_does_not_send_notification_on_success(monkeypatch):
+    main_module = _stub_main_run_for_notifications(monkeypatch, run_results=(True,))
+    from utils import notify
+
+    calls = []
+    monkeypatch.setattr(notify, "notify_failure", lambda *a, **k: calls.append(a) or True)
+
+    assert main_module.main() == 0
+    assert calls == []
+
+
+def test_main_notification_exception_preserves_exit_code_and_releases_guard(monkeypatch):
+    events = []
+
+    class Guard:
+        def close(self):
+            events.append("guard.close")
+
+    main_module = _stub_main_run_for_notifications(
+        monkeypatch, allow_multi=False, guard=Guard()
+    )
+    from utils import notify
+
+    def boom(*_args, **_kwargs):
+        events.append("notify.boom")
+        raise RuntimeError("notification failed")
+
+    monkeypatch.setattr(notify, "notify_failure", boom)
+
+    assert main_module.main() == 3
+    assert events == ["notify.boom", "guard.close"]
+
+
+def test_main_notifies_on_early_account_read_failure_without_guard(monkeypatch):
+    main_module = _stub_main_run_for_notifications(monkeypatch, allow_multi=True)
+    from utils import notify
+
+    def fail_load():
+        raise FileNotFoundError("accounts.txt missing")
+
+    calls = []
+    monkeypatch.setattr(main_module, "load_accounts", fail_load)
+    monkeypatch.setattr(notify, "notify_failure", lambda *a, **k: calls.append(a) or True)
+
+    assert main_module.main() == 4
+    assert len(calls) == 1
+    assert calls[0][0] == 4
+
+
+def test_direct_run_early_failure_still_notifies(monkeypatch):
+    main_module = _stub_main_run_for_notifications(monkeypatch, allow_multi=True)
+    from utils import notify
+
+    calls = []
+    monkeypatch.setattr(
+        main_module, "load_accounts",
+        lambda: (_ for _ in ()).throw(FileNotFoundError("accounts.txt missing")),
+    )
+    monkeypatch.setattr(notify, "notify_failure", lambda *a, **k: calls.append(a) or True)
+
+    assert main_module._run() == 4
+    assert len(calls) == 1
+    assert calls[0][0] == 4
+    assert isinstance(calls[0][1], notify.RunLog)
+
+
+@pytest.mark.parametrize("exit_code", [2, 3, 4, 5])
+def test_each_failure_exit_code_notifies_exactly_once(monkeypatch, exit_code):
+    main_module = _stub_main_run_for_notifications(monkeypatch, run_results=(False,))
+    from utils import notify
+
+    if exit_code == 2:
+        monkeypatch.setattr(main_module.profile, "warmup_temp_dir", lambda *a, **k: False)
+    elif exit_code == 4:
+        monkeypatch.setattr(
+            main_module, "load_accounts",
+            lambda: (_ for _ in ()).throw(FileNotFoundError("missing")),
+        )
+    elif exit_code == 5:
+        monkeypatch.setattr(
+            main_module, "sync_playwright",
+            lambda: (_ for _ in ()).throw(main_module.RiskDetectionError("risk")),
+        )
+
+    calls = []
+    monkeypatch.setattr(notify, "notify_failure", lambda *a, **k: calls.append(a) or True)
+
+    assert main_module.main() == exit_code
+    assert len(calls) == 1
+    assert calls[0][0] == exit_code
+
+
+def test_failure_body_contains_run_identity_and_no_smtp_secret(monkeypatch, tmp_path):
+    from utils import notify
+
+    log_path = tmp_path / "run_current.log"
+    run_log = notify.RunLog(
+        "本次日志内容",
+        run_info={
+            "pid": 4321,
+            "log_path": str(log_path),
+            "started_at": "2026-11-08 19:58:38",
+            "log_mtime": "2026-11-08 20:05:00",
+        },
+    )
+    sent = {}
+    monkeypatch.setattr(
+        notify,
+        "load_smtp_config",
+        lambda *a, **k: {
+            "host": "smtp.example.invalid",
+            "port": 465,
+            "user": "u",
+            "password": "synthetic-smtp-secret",
+            "to": ["a@b.c"],
+            "sender": "u",
+            "use_ssl": True,
+        },
+    )
+    monkeypatch.setattr(notify, "send_mail", lambda cfg, s, b, **k: sent.update(body=b))
+
+    assert notify.notify_failure(3, run_log) is True
+    body = sent["body"]
+    assert "本次运行 PID：4321" in body
+    assert f"本次运行日志：{log_path}" in body
+    assert "2026-11-08 19:58:38" in body
+    assert "2026-11-08 20:05:00" in body
+    assert "synthetic-smtp-secret" not in body
+
+
+def test_notification_log_tail_uses_this_run_log_not_newer_log(monkeypatch, tmp_path):
+    current_log = tmp_path / "run_current.log"
+    newer_log = tmp_path / "run_newer.log"
+    current_log.write_text("CURRENT RUN ONLY\n", encoding="utf-8")
+    newer_log.write_text("NEW INSTANCE LOG\n", encoding="utf-8")
+    monkeypatch.setenv("BING_REWARDS_LOG_FILE", str(current_log))
+    main_module = _stub_main_run_for_notifications(
+        monkeypatch, allow_multi=True
+    )
+    from utils import notify
+
+    calls = []
+    monkeypatch.setattr(notify, "notify_failure", lambda *a, **k: calls.append(a) or True)
+
+    assert main_module.main() == 3
+    assert len(calls) == 1
+    run_log = calls[0][1]
+    body = notify.build_body(calls[0][0], run_log)
+    assert f"本次运行日志：{current_log}" in body
+    assert "CURRENT RUN ONLY" in body
+    assert "NEW INSTANCE LOG" not in body
+
+
 def test_detect_risk_control_ignores_generic_captcha_on_bing_search():
     class Page:
         url = "https://cn.bing.com/search?q=captcha"
@@ -780,6 +1039,1485 @@ def test_read_streak_progress_parses_edge_and_mobile():
     assert tasks.read_streak_progress(Page(), "mobile") == (1, 1)
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://rewards.bing.com/promo/edge-browsing-streak",
+        "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL&OCID=AIDcmm",
+    ],
+)
+def test_is_edge_streak_url_accepts_official_activity_url(url):
+    assert tasks._is_edge_streak_url(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example/promo/edge-browsing-streak",
+        "https://www.bing.com/search?q=edge-browsing-streak",
+        "http://rewards.bing.com/promo/edge-browsing-streak",
+        "file:///promo/edge-browsing-streak",
+        "https://rewards.bing.com/promo/edge-browsing-streak/extra",
+        "https://rewards.bing.com:8443/promo/edge-browsing-streak",
+    ],
+)
+def test_is_edge_streak_url_rejects_untrusted_urls(url):
+    assert tasks._is_edge_streak_url(url) is False
+
+
+def test_edge_browser_profile_login_detects_user_name(tmp_path):
+    profile = tmp_path / "Default"
+    profile.mkdir()
+    (profile / "Preferences").write_text("{}", encoding="utf-8")
+    local_state = {
+        "profile": {
+            "info_cache": {
+                "Default": {"user_name": "synthetic@example.invalid"}
+            }
+        }
+    }
+    (tmp_path / "Local State").write_text(
+        json.dumps(local_state), encoding="utf-8"
+    )
+
+    assert tasks.edge_browser_profile_logged_in(tmp_path) is True
+
+
+def test_edge_browser_profile_login_detects_account_info(tmp_path):
+    profile = tmp_path / "Default"
+    profile.mkdir()
+    (profile / "Preferences").write_text(
+        json.dumps({"account_info": [{"account_name": "synthetic"}]}),
+        encoding="utf-8",
+    )
+    local_state = {"profile": {"info_cache": {"Default": {"user_name": ""}}}}
+    (tmp_path / "Local State").write_text(
+        json.dumps(local_state), encoding="utf-8"
+    )
+
+    assert tasks.edge_browser_profile_logged_in(tmp_path) is True
+
+
+def test_edge_browser_profile_login_requires_positive_account_evidence(tmp_path):
+    profile = tmp_path / "Default"
+    profile.mkdir()
+    (profile / "Preferences").write_text(
+        json.dumps({"account_info": []}), encoding="utf-8"
+    )
+    local_state = {"profile": {"info_cache": {"Default": {"user_name": ""}}}}
+    (tmp_path / "Local State").write_text(
+        json.dumps(local_state), encoding="utf-8"
+    )
+
+    assert tasks.edge_browser_profile_logged_in(tmp_path) is False
+
+
+def test_edge_browser_profile_login_missing_or_corrupt_json_is_not_logged_in(tmp_path):
+    missing = tmp_path / "missing"
+    assert tasks.edge_browser_profile_logged_in(missing) is False
+
+    corrupt = tmp_path / "corrupt"
+    profile = corrupt / "Default"
+    profile.mkdir(parents=True)
+    (corrupt / "Local State").write_text("{broken", encoding="utf-8")
+    (profile / "Preferences").write_text("{broken", encoding="utf-8")
+    assert tasks.edge_browser_profile_logged_in(corrupt) is False
+
+
+def test_open_edge_streak_waits_for_delayed_redirect():
+    """新标签页可慢跳转；不关闭它以免打断活动上报，残余标签页风险已知。"""
+    class Locator:
+        def __init__(self, page, kind, visible=True):
+            self.page = page
+            self.kind = kind
+            self.visible = visible
+            self.first = self
+
+        def count(self):
+            return 1 if self.visible else 0
+
+        def is_visible(self):
+            return self.visible
+
+        def wait_for(self, **_):
+            if not self.visible:
+                raise TimeoutError("not visible")
+
+        def click(self):
+            if self.kind == "card":
+                self.page.card_clicked = True
+                self.page.dialog_open = True
+            elif self.kind == "link":
+                self.page.link_clicked = True
+                self.page.context.pages.append(self.page.target)
+
+    class Context:
+        def __init__(self, page):
+            self.pages = [page]
+
+    class Target:
+        def __init__(self, page):
+            self.page = page
+            self.url = tasks.EDGE_STREAK_LAUNCH_URL
+            self.closed = False
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+        def wait_for_load_state(self, *_args, **_kwargs):
+            return None
+
+        def wait_for_timeout(self, ms):
+            self.page._advance(ms)
+
+    class Page:
+        def __init__(self):
+            self.url = "https://rewards.bing.com/dashboard"
+            self.context = Context(self)
+            self.dialog_open = False
+            self.card_clicked = False
+            self.link_clicked = False
+            self.closed = False
+            self.elapsed_ms = 0
+            self.target = Target(self)
+
+        def _advance(self, ms):
+            self.elapsed_ms += ms
+            if self.elapsed_ms >= 7000:
+                self.target.url = "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
+
+        def locator(self, selector):
+            if 'button:has-text("Microsoft Edge")' in selector:
+                return Locator(self, "card")
+            if "role='dialog'" in selector and "使用 Edge" in selector:
+                return Locator(self, "link", visible=self.dialog_open and not self.link_clicked)
+            return Locator(self, "other", visible=False)
+
+        def wait_for_timeout(self, ms):
+            self._advance(ms)
+
+    page = Page()
+
+    original_pages = list(page.context.pages)
+    assert tasks._open_edge_streak(page) is True
+    assert page.card_clicked is True
+    assert page.link_clicked is True
+    assert "edge-browsing-streak" in page.target.url
+    assert original_pages == page.context.pages[:1]
+    assert all(not item.closed for item in original_pages)
+    assert page.target.closed is False
+
+
+def test_edge_streak_wait_skips_bad_and_closed_pages_and_finds_new_target():
+    class BadPage:
+        def is_closed(self):
+            return False
+
+        @property
+        def url(self):
+            raise RuntimeError("page gone")
+
+    class ClosedPage:
+        url = "https://rewards.bing.com/promo/edge-browsing-streak?form=CLOSED"
+
+        def is_closed(self):
+            return True
+
+    class Target:
+        url = "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
+        closed = False
+
+        def is_closed(self):
+            return self.closed
+
+    class Page:
+        url = "https://rewards.bing.com/dashboard"
+        closed = False
+
+        def __init__(self):
+            self.bad = BadPage()
+            self.closed_page = ClosedPage()
+            self.target = Target()
+            self.context = type(
+                "Context", (), {"pages": [self, self.bad, self.closed_page, self.target]}
+            )()
+
+        def is_closed(self):
+            return self.closed
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    page = Page()
+    result = tasks._wait_for_edge_streak_target(
+        page,
+        [page, page.bad, page.closed_page],
+        tasks.EDGE_STREAK_REDIRECT_TIMEOUT_MS,
+        existing_pages={page},
+    )
+    assert result is page.target
+
+
+def test_edge_streak_wait_skips_is_closed_error_and_finds_later_redirect(monkeypatch):
+    class BrokenPage:
+        url = "https://rewards.bing.com/promo/edge-browsing-streak?form=BROKEN"
+
+        def is_closed(self):
+            raise RuntimeError("cannot read page state")
+
+    class DelayedTarget:
+        def __init__(self):
+            self.url = tasks.EDGE_STREAK_LAUNCH_URL
+            self.closed = False
+
+        def is_closed(self):
+            return self.closed
+
+    class Page:
+        url = "https://rewards.bing.com/dashboard"
+        closed = False
+
+        def __init__(self):
+            self.broken = BrokenPage()
+            self.target = DelayedTarget()
+            self.context = type(
+                "Context", (), {"pages": [self, self.broken, self.target]}
+            )()
+
+        def is_closed(self):
+            return self.closed
+
+        def wait_for_timeout(self, _ms):
+            self.target.url = (
+                "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
+            )
+
+    page = Page()
+    monkeypatch.setattr(tasks, "EDGE_STREAK_POLL_INTERVAL_MS", 1)
+
+    result = tasks._wait_for_edge_streak_target(
+        page,
+        [page, page.broken],
+        tasks.EDGE_STREAK_REDIRECT_TIMEOUT_MS,
+        existing_pages={page, page.broken},
+    )
+    assert result is page.target
+
+
+def test_open_edge_streak_does_not_click_without_page_snapshot(monkeypatch):
+    class Locator:
+        def __init__(self, page, kind):
+            self.page = page
+            self.kind = kind
+            self.first = self
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def wait_for(self, **_):
+            return None
+
+        def click(self):
+            if self.kind == "link":
+                self.page.link_clicked = True
+                self.page.context.pages.append(self.page.stale)
+
+    class BrokenContext:
+        @property
+        def pages(self):
+            raise RuntimeError("context pages unavailable")
+
+    class StalePage:
+        url = "https://rewards.bing.com/promo/edge-browsing-streak?form=STALE"
+        closed = False
+
+        def is_closed(self):
+            return self.closed
+
+    class Page:
+        url = "https://rewards.bing.com/dashboard"
+        closed = False
+
+        def __init__(self):
+            self.stale = StalePage()
+            self.context = BrokenContext()
+            self.link_clicked = False
+
+        def is_closed(self):
+            return self.closed
+
+        def locator(self, selector):
+            if "role='dialog'" in selector:
+                return Locator(self, "link")
+            return Locator(self, "card")
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    page = Page()
+    calls = []
+    monkeypatch.setattr(tasks, "safe_goto", lambda *args, **kwargs: calls.append(args[1]))
+    monkeypatch.setattr(tasks, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 50)
+
+    assert tasks._open_edge_streak(page) is False
+    assert page.link_clicked is False
+    assert calls == [tasks.EDGE_STREAK_LAUNCH_URL]
+    assert page.stale.closed is False
+
+
+def test_open_edge_streak_ignores_stale_activity_page_when_fallback_does_not_navigate(monkeypatch):
+    class EmptyLocator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class StalePage:
+        url = "https://rewards.bing.com/promo/edge-browsing-streak?form=STALE"
+        closed = False
+
+        def is_closed(self):
+            return self.closed
+
+    class Page:
+        url = "https://rewards.bing.com/dashboard"
+        closed = False
+
+        def __init__(self):
+            self.stale = StalePage()
+            self.context = type("Context", (), {"pages": [self, self.stale]})()
+
+        def is_closed(self):
+            return self.closed
+
+        def locator(self, _selector):
+            return EmptyLocator()
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    page = Page()
+    monkeypatch.setattr(tasks, "safe_goto", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(tasks, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 50)
+
+    assert tasks._open_edge_streak(page) is False
+    assert page.closed is False
+    assert page.stale.closed is False
+
+
+def test_open_edge_streak_falls_back_to_official_launch_url(monkeypatch):
+    """卡片/弹窗不可用时必须使用官方稳定链接兜底，而不是直接报告入口消失。"""
+    class EmptyLocator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class Context:
+        pages = []
+
+    class Page:
+        url = "https://rewards.bing.com/dashboard"
+
+        def __init__(self):
+            self.context = Context()
+            self.context.pages = [self]
+
+        def locator(self, _selector):
+            return EmptyLocator()
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    page = Page()
+    calls = []
+
+    def fake_goto(target, url, **_):
+        calls.append(url)
+        target.url = "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
+
+    monkeypatch.setattr(tasks, "safe_goto", fake_goto)
+
+    assert tasks._open_edge_streak(page) is True
+    assert calls == [tasks.EDGE_STREAK_LAUNCH_URL]
+
+
+def test_edge_streak_activates_new_bing_page_and_closes_only_owned_pages(monkeypatch):
+    class EmptyLocator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class Mouse:
+        def __init__(self, owner):
+            self.owner = owner
+
+        def wheel(self, *_args):
+            self.owner.wheel_count += 1
+
+    class Page:
+        def __init__(self, name, url):
+            self.name = name
+            self.url = url
+            self.closed = False
+            self.wheel_count = 0
+            self.context = None
+            self.mouse = Mouse(self)
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+        def locator(self, _selector):
+            return EmptyLocator()
+
+    class ActivationLink:
+        first = None
+
+        def __init__(self, activity):
+            self.first = self
+            self.activity = activity
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def click(self):
+            self.activity.link_clicked = True
+            self.activity.context.pages.append(self.activity.activation)
+
+    class ActivityPage(Page):
+        def __init__(self, name, url):
+            super().__init__(name, url)
+            self.activation = None
+            self.link_clicked = False
+
+        def locator(self, selector):
+            if "开始在 Edge 上浏览" in selector:
+                return ActivationLink(self)
+            return EmptyLocator()
+
+    class Context:
+        def __init__(self):
+            self.pages = []
+
+    context = Context()
+    dashboard = Page("dashboard", "https://rewards.bing.com/dashboard")
+    activity = ActivityPage(
+        "activity", "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
+    )
+    activation = Page("activation", "https://cn.bing.com/?rwgbopen=1&FORM=rwbsl1")
+    historical = Page("historical", "https://example.com/user-tab")
+    dashboard.context = context
+    activity.context = context
+    activation.context = context
+    historical.context = context
+    activity.activation = activation
+    context.pages = [historical, dashboard]
+
+    progress = iter([(0, 30), (30, 30)])
+    progress_calls = []
+    browsing_calls = []
+
+    def fake_read(target, label):
+        assert label == "edge"
+        assert target is dashboard
+        progress_calls.append(target)
+        return next(progress)
+
+    prepare_calls = []
+
+    def fake_prepare(_target):
+        prepare_calls.append(_target)
+        if len(prepare_calls) == 1:
+            context.pages.append(activity)
+            return tasks.EdgeStreakEntry(activity, (activity,), True)
+        context.pages.append(activity)
+        return tasks.EdgeStreakEntry(activity, (), False)
+
+    def fake_goto(target, url, **_kwargs):
+        if target is dashboard:
+            assert url == tasks.REWARDS_DASHBOARD
+        else:
+            assert target is activation
+            browsing_calls.append((target, url))
+
+    monkeypatch.setattr(tasks, "read_streak_progress", fake_read)
+    monkeypatch.setattr(tasks, "_prepare_edge_streak", fake_prepare)
+    def fake_activation(*_args, **_kwargs):
+        activity.link_clicked = True
+        return tasks.EdgeStreakActivation(activation, (activation,), True)
+
+    monkeypatch.setattr(tasks, "_activate_edge_streak", fake_activation)
+    monkeypatch.setattr(tasks, "safe_goto", fake_goto)
+
+    assert tasks.do_edge_browsing_streak(dashboard, minutes=6, poll_seconds=60) == 1
+    assert activity.link_clicked is True
+    assert activation.wheel_count > 0
+    assert dashboard.wheel_count == 0
+    assert browsing_calls
+    assert all(target is activation for target, _url in browsing_calls)
+    assert progress_calls == [dashboard, dashboard]
+    assert prepare_calls == [dashboard]
+    assert activity.closed is True
+    assert activation.closed is True
+    assert dashboard.closed is False
+    assert historical.closed is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://cn.bing.com/?rwgbopen=1&FORM=rwbsl1",
+        "https://www.bing.com/",
+        "https://bing.com",
+    ],
+)
+def test_is_edge_activation_url_accepts_bing_home(url):
+    assert tasks._is_edge_activation_url(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://cn.bing.com/search?q=edge",
+        "http://cn.bing.com/",
+        "https://cn.bing.com:8443/",
+        "https://evil.example/",
+    ],
+)
+def test_is_edge_activation_url_rejects_untrusted_urls(url):
+    assert tasks._is_edge_activation_url(url) is False
+
+
+def test_activate_edge_streak_collects_page_created_after_click_timeout(monkeypatch):
+    class EmptyLocator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class ActivationLink:
+        first = None
+
+        def __init__(self, activity):
+            self.first = self
+            self.activity = activity
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def click(self):
+            return None
+
+    class Page:
+        def __init__(self, name, url):
+            self.name = name
+            self.url = url
+            self.closed = False
+            self.context = type("Context", (), {"pages": []})()
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+        def locator(self, selector):
+            if "开始在 Edge 上浏览" in selector:
+                return ActivationLink(self)
+            return EmptyLocator()
+
+        def wait_for_timeout(self, ms):
+            self.context.pages.append(self.delayed)
+
+    activity = Page(
+        "activity", "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
+    )
+    delayed = Page("delayed", "about:blank")
+    delayed.wait_for_timeout = lambda _ms: None
+    activity.delayed = delayed
+    activity.context.pages = [activity]
+    monkeypatch.setattr(tasks, "EDGE_STREAK_ACTIVATION_POLL_MS", 1)
+
+    result = tasks._activate_edge_streak(
+        activity, timeout_ms=1, activation_timeout_ms=1
+    )
+
+    assert result.activated is False
+    assert result.browsing_page is None
+    assert delayed in result.created_pages
+
+
+def test_activate_edge_streak_collects_page_when_click_raises(monkeypatch):
+    class EmptyLocator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class ActivationLink:
+        first = None
+
+        def __init__(self, activity):
+            self.first = self
+            self.activity = activity
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def click(self):
+            self.activity.context.pages.append(self.activity.delayed)
+            raise RuntimeError("click interrupted after navigation")
+
+    class Page:
+        def __init__(self, name, url):
+            self.name = name
+            self.url = url
+            self.closed = False
+            self.context = type("Context", (), {"pages": []})()
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+        def locator(self, selector):
+            if "开始在 Edge 上浏览" in selector:
+                return ActivationLink(self)
+            return EmptyLocator()
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    activity = Page(
+        "activity", "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
+    )
+    delayed = Page("delayed", "about:blank")
+    activity.delayed = delayed
+    activity.context.pages = [activity]
+    monkeypatch.setattr(tasks, "EDGE_STREAK_ACTIVATION_POLL_MS", 1)
+
+    result = tasks._activate_edge_streak(
+        activity, timeout_ms=1, activation_timeout_ms=1
+    )
+
+    assert result.activated is False
+    assert result.browsing_page is None
+    assert delayed in result.created_pages
+
+
+@pytest.mark.parametrize("click_raises", [False, True])
+def test_edge_streak_unexpected_new_page_is_cleaned_by_finally(monkeypatch, click_raises):
+    class EmptyLocator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class ActivationLink:
+        first = None
+
+        def __init__(self, activity):
+            self.first = self
+            self.activity = activity
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def click(self):
+            if click_raises:
+                self.activity.context.pages.append(self.activity.delayed)
+                raise RuntimeError("click interrupted")
+            return None
+
+    class Page:
+        def __init__(self, name, url):
+            self.name = name
+            self.url = url
+            self.closed = False
+            self.context = type("Context", (), {"pages": []})()
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+        def locator(self, selector):
+            if "开始在 Edge 上浏览" in selector:
+                return ActivationLink(self)
+            return EmptyLocator()
+
+        def wait_for_timeout(self, _ms):
+            if self.delayed not in self.context.pages:
+                self.context.pages.append(self.delayed)
+
+    dashboard = Page("dashboard", "https://rewards.bing.com/dashboard")
+    activity = Page(
+        "activity", "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
+    )
+    delayed = Page("delayed", "about:blank")
+    delayed.wait_for_timeout = lambda _ms: None
+    historical = Page("historical", "https://example.com/user-tab")
+    activity.delayed = delayed
+    activity.context.pages = [historical, dashboard, activity]
+    dashboard.context = activity.context
+    historical.context = activity.context
+
+    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: (0, 30))
+    monkeypatch.setattr(
+        tasks,
+        "_prepare_edge_streak",
+        lambda _page: tasks.EdgeStreakEntry(activity, (activity,), True),
+    )
+    monkeypatch.setattr(tasks, "EDGE_STREAK_ACTIVATION_TIMEOUT_MS", 1)
+    monkeypatch.setattr(tasks, "EDGE_STREAK_ACTIVATION_POLL_MS", 1)
+    goto_calls = []
+    monkeypatch.setattr(
+        tasks, "safe_goto", lambda target, url, **kwargs: goto_calls.append(target)
+    )
+
+    assert tasks.do_edge_browsing_streak(dashboard, minutes=1, poll_seconds=60) == 0
+    assert goto_calls == []
+    assert delayed.closed is True
+    assert activity.closed is True
+    assert dashboard.closed is False
+    assert historical.closed is False
+
+
+def test_edge_streak_activation_without_new_page_is_failure(monkeypatch):
+    class EmptyLocator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class Link:
+        first = None
+
+        def __init__(self, activity):
+            self.first = self
+            self.activity = activity
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def click(self):
+            self.activity.link_clicked = True
+
+    class Page:
+        def __init__(self, name, url):
+            self.name = name
+            self.url = url
+            self.closed = False
+            self.wheel_count = 0
+            self.mouse = self
+
+        def wheel(self, *_args):
+            self.wheel_count += 1
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    class Activity(Page):
+        def __init__(self):
+            super().__init__(
+                "activity",
+                "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL",
+            )
+            self.link_clicked = False
+
+        def locator(self, selector):
+            if "开始在 Edge 上浏览" in selector:
+                return Link(self)
+            return EmptyLocator()
+
+    class Context:
+        pages = []
+
+    dashboard = Page("dashboard", "https://rewards.bing.com/dashboard")
+    activity = Activity()
+    context = Context()
+    dashboard.context = context
+    activity.context = context
+    context.pages = [dashboard, activity]
+
+    activation = tasks._activate_edge_streak(
+        activity, dashboard, timeout_ms=1, activation_timeout_ms=1
+    )
+
+    assert activity.link_clicked is True
+    assert activation.activated is False
+    assert activation.browsing_page is None
+    assert activation.created_pages == ()
+
+
+def test_edge_streak_waits_for_delayed_activation_link(monkeypatch):
+    class EmptyLocator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class DelayedLink:
+        first = None
+
+        def __init__(self, activity):
+            self.first = self
+            self.activity = activity
+
+        def count(self):
+            return 1 if self.activity.rendered else 0
+
+        def is_visible(self):
+            return self.activity.rendered
+
+        def click(self):
+            self.activity.link_clicked = True
+
+    class Page:
+        def __init__(self, name, url):
+            self.name = name
+            self.url = url
+            self.url = url
+            self.closed = False
+            self.context = None
+
+        def is_closed(self):
+            return self.closed
+
+        def locator(self, _selector):
+            return EmptyLocator()
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    class Activity(Page):
+        def __init__(self):
+            super().__init__(
+                "activity",
+                "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL",
+            )
+            self.rendered = False
+            self.link_clicked = False
+            self.polls = 0
+
+        def locator(self, selector):
+            if "开始在 Edge 上浏览" in selector:
+                return DelayedLink(self)
+            return EmptyLocator()
+
+        def wait_for_timeout(self, _ms):
+            self.polls += 1
+            if self.polls >= 2:
+                self.rendered = True
+
+    class Context:
+        pages = []
+
+    dashboard = Page("dashboard", "https://rewards.bing.com/dashboard")
+    activity = Activity()
+    context = Context()
+    dashboard.context = context
+    activity.context = context
+    context.pages = [dashboard, activity]
+    monkeypatch.setattr(tasks, "EDGE_STREAK_ACTIVATION_POLL_MS", 1)
+
+    activation = tasks._activate_edge_streak(
+        activity,
+        dashboard,
+        timeout_ms=1,
+        activation_timeout_ms=20,
+    )
+
+    assert activity.link_clicked is True
+    assert activation.activated is False
+    assert activation.browsing_page is None
+    assert activation.created_pages == ()
+
+
+def test_edge_streak_activation_failure_does_not_navigate_dashboard(monkeypatch):
+    class Page:
+        def __init__(self, name, url):
+            self.name = name
+            self.url = url
+            self.closed = False
+            self.context = type("Context", (), {"pages": []})()
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+    dashboard = Page("dashboard", "https://rewards.bing.com/dashboard")
+    activity = Page(
+        "activity", "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
+    )
+    historical = Page("historical", "https://example.com/user-tab")
+    dashboard.context.pages = [historical, dashboard, activity]
+
+    def fail_activation(*_args, **_kwargs):
+        new_page = Page("new", tasks.EDGE_STREAK_LAUNCH_URL)
+        dashboard.context.pages.append(new_page)
+        return tasks.EdgeStreakActivation(None, (new_page,), False)
+
+    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: (0, 30))
+    monkeypatch.setattr(
+        tasks,
+        "_prepare_edge_streak",
+        lambda _page: tasks.EdgeStreakEntry(activity, (activity,), True),
+    )
+    monkeypatch.setattr(tasks, "_activate_edge_streak", fail_activation)
+    goto_calls = []
+    monkeypatch.setattr(
+        tasks, "safe_goto", lambda target, url, **kwargs: goto_calls.append(target)
+    )
+
+    assert tasks.do_edge_browsing_streak(dashboard, minutes=1, poll_seconds=60) == 0
+    assert goto_calls == []
+    assert dashboard.context.pages[-1].closed is True
+    assert activity.closed is True
+    assert dashboard.closed is False
+    assert historical.closed is False
+
+
+def test_prepare_edge_streak_returns_opened_page_when_redirect_times_out(monkeypatch):
+    class EmptyLocator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class Link:
+        first = None
+
+        def __init__(self, page):
+            self.first = self
+            self.page = page
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def wait_for(self, **_kwargs):
+            return None
+
+        def click(self):
+            self.page.context.pages.append(self.page.opened)
+
+    class Page:
+        url = "https://rewards.bing.com/dashboard"
+
+        def __init__(self, name, url=None):
+            self.name = name
+            if url is not None:
+                self.url = url
+            self.opened = None
+            self.closed = False
+            self.context = type("Context", (), {"pages": [self]})()
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+        def locator(self, selector):
+            if "Microsoft Edge" in selector:
+                return EmptyLocator()
+            if "role='dialog'" in selector:
+                return Link(self)
+            return EmptyLocator()
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    page = Page("dashboard")
+    page.opened = Page(
+        "opened", "https://www.microsoft.com/edge/launch/rewards-browsing-streak1"
+    )
+    page.opened.context = page.context
+    monkeypatch.setattr(tasks, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 1)
+
+    entry = tasks._prepare_edge_streak(page)
+
+    assert entry.activity_page is None
+    assert entry.created_pages == (page.opened,)
+    assert entry.can_cleanup is True
+
+
+def test_edge_streak_new_unconfirmed_page_is_cleaned_by_owner():
+    class Page:
+        def __init__(self, name, url):
+            self.name = name
+            self.url = url
+            self.closed = False
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+    new_page = Page("new", "https://www.microsoft.com/edge/launch/rewards-browsing-streak1")
+
+    entry = tasks.EdgeStreakEntry(None, (new_page,), True)
+
+    assert entry.activity_page is None
+    assert entry.created_pages == (new_page,)
+    assert entry.can_cleanup is True
+    tasks._close_edge_streak_pages(object(), entry.created_pages)
+    assert new_page.closed is True
+
+
+def test_edge_streak_reuses_browsing_page_for_progress_15_to_30(monkeypatch):
+    class Mouse:
+        def __init__(self, page):
+            self.page = page
+
+        def wheel(self, *_args):
+            self.page.wheel_count += 1
+
+    class Page:
+        def __init__(self, name, url):
+            self.name = name
+            self.url = url
+            self.closed = False
+            self.wheel_count = 0
+            self.mouse = Mouse(self)
+            self.context = type("Context", (), {"pages": []})()
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    dashboard = Page("dashboard", "https://rewards.bing.com/dashboard")
+    activity = Page(
+        "activity", "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
+    )
+    activation = Page("activation", "https://cn.bing.com/?rwgbopen=1&FORM=rwbsl1")
+    historical = Page("historical", "https://example.com/user-tab")
+    dashboard.context.pages = [historical, dashboard]
+    activity.context = dashboard.context
+    activation.context = dashboard.context
+
+    progress_values = iter([(15, 30), (20, 30), (25, 30), (30, 30)])
+    progress_targets = []
+    browsing_targets = []
+    prepare_calls = []
+    activation_calls = []
+
+    def fake_read(target, label):
+        assert label == "edge"
+        progress_targets.append(target)
+        return next(progress_values)
+
+    def fake_prepare(target):
+        prepare_calls.append(target)
+        return tasks.EdgeStreakEntry(activity, (activity,), True)
+
+    def fake_activate(*_args, **_kwargs):
+        activation_calls.append(True)
+        return tasks.EdgeStreakActivation(activation, (activation,), True)
+
+    def fake_goto(target, _url, **_kwargs):
+        if target is dashboard:
+            return None
+        assert target is activation
+        browsing_targets.append(target)
+
+    monkeypatch.setattr(tasks, "read_streak_progress", fake_read)
+    monkeypatch.setattr(tasks, "_prepare_edge_streak", fake_prepare)
+    monkeypatch.setattr(tasks, "_activate_edge_streak", fake_activate)
+    monkeypatch.setattr(tasks, "safe_goto", fake_goto)
+
+    assert tasks.do_edge_browsing_streak(dashboard, minutes=20, poll_seconds=60) == 1
+    assert prepare_calls == [dashboard]
+    assert activation_calls == [True]
+    assert progress_targets == [dashboard] * 4
+    assert len(browsing_targets) == 15
+    assert all(target is activation for target in browsing_targets)
+    assert activation.wheel_count > 0
+    assert dashboard.wheel_count == 0
+    assert activity.closed is True
+    assert activation.closed is True
+    assert dashboard.closed is False
+    assert historical.closed is False
+
+
+def test_edge_streak_not_logged_in_does_not_open_or_wait(monkeypatch):
+    actions = []
+    page = type("Page", (), {"url": "https://rewards.bing.com/dashboard"})()
+
+    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: (0, 30))
+    monkeypatch.setattr(tasks, "edge_browser_profile_logged_in", lambda *_args: False)
+    monkeypatch.setattr(
+        tasks,
+        "_prepare_edge_streak",
+        lambda *_args: actions.append("open") or tasks.EdgeStreakEntry(page, (), False),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_activate_edge_streak",
+        lambda *_args, **_kwargs: actions.append("activate"),
+    )
+    monkeypatch.setattr(
+        tasks, "safe_goto", lambda *_args, **_kwargs: actions.append("navigate")
+    )
+
+    assert tasks.do_edge_browsing_streak(page, minutes=30, poll_seconds=60) == 0
+    assert actions == []
+
+
+def test_edge_streak_waits_full_30_minutes_when_logged_in_but_zero(
+    monkeypatch, capsys
+):
+    class Page:
+        url = "https://rewards.bing.com/dashboard"
+        closed = False
+        mouse = type("Mouse", (), {"wheel": lambda *_args: None})()
+
+        def is_closed(self):
+            return self.closed
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    page = Page()
+    progress_calls = []
+    elapsed_marks = []
+
+    def fake_read(*_args):
+        progress_calls.append(len(progress_calls) + 1)
+        return (0, 30)
+
+    def fake_goto(_target, url, **_kwargs):
+        if url == tasks.REWARDS_DASHBOARD:
+            elapsed_marks.append(len(progress_calls))
+
+    monkeypatch.setattr(tasks, "read_streak_progress", fake_read)
+    monkeypatch.setattr(
+        tasks,
+        "_prepare_edge_streak",
+        lambda target: tasks.EdgeStreakEntry(target, (), False),
+    )
+    monkeypatch.setattr(
+        tasks,
+        "_activate_edge_streak",
+        lambda *_args, **_kwargs: tasks.EdgeStreakActivation(page, (), True),
+    )
+    monkeypatch.setattr(tasks, "safe_goto", fake_goto)
+
+    assert tasks.do_edge_browsing_streak(page, minutes=30, poll_seconds=60) == 0
+    output = capsys.readouterr().out
+    assert len(progress_calls) == 7
+    assert "已等待 30 分钟" in output
+    assert "未回写打卡进度" in output
+
+
+def test_edge_streak_zero_poll_seconds_does_not_loop(monkeypatch):
+    class Page:
+        url = "https://rewards.bing.com/dashboard"
+        closed = False
+        mouse = type("Mouse", (), {"wheel": lambda *_args: None})()
+
+        def is_closed(self):
+            return self.closed
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    page = Page()
+    waits = []
+
+    def fake_wait(ms):
+        waits.append(ms)
+        assert len(waits) < 1000
+
+    page.wait_for_timeout = fake_wait
+    progress_values = iter([(0, 30)] + [(0, 30)] * 100)
+    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: next(progress_values))
+    monkeypatch.setattr(
+        tasks,
+        "_prepare_edge_streak",
+        lambda target: tasks.EdgeStreakEntry(target, (), False),
+    )
+    activation = tasks.EdgeStreakActivation(page, (), True)
+    monkeypatch.setattr(
+        tasks,
+        "_activate_edge_streak",
+        lambda *_args, **_kwargs: activation,
+    )
+    monkeypatch.setattr(tasks, "safe_goto", lambda *_args, **_kwargs: None)
+
+    assert tasks.do_edge_browsing_streak(page, minutes=1, poll_seconds=0) == 0
+    assert waits
+
+
+def test_edge_streak_cleanup_continues_when_one_close_raises():
+    class Page:
+        def __init__(self, name, fail=False):
+            self.name = name
+            self.closed = False
+            self.fail = fail
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            if self.fail:
+                raise RuntimeError("close failed")
+            self.closed = True
+
+    current = Page("current")
+    broken = Page("broken", fail=True)
+    owned = Page("owned")
+
+    tasks._close_edge_streak_pages(current, (broken, owned))
+
+    assert current.closed is False
+    assert broken.closed is False
+    assert owned.closed is True
+
+
+def test_edge_streak_cleanup_runs_on_failure(monkeypatch):
+    class Page:
+        def __init__(self, name, url):
+            self.name = name
+            self.url = url
+            self.closed = False
+            self.context = type("Context", (), {"pages": []})()
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+    dashboard = Page("dashboard", "https://rewards.bing.com/dashboard")
+    activity = Page(
+        "activity", "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
+    )
+    historical = Page("historical", "https://example.com/user-tab")
+    dashboard.context.pages = [historical, dashboard]
+    activity.context = dashboard.context
+
+    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: (0, 30))
+    monkeypatch.setattr(
+        tasks,
+        "_prepare_edge_streak",
+        lambda _page: tasks.EdgeStreakEntry(activity, (activity,), True),
+    )
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("activation failed")
+
+    monkeypatch.setattr(tasks, "_activate_edge_streak", fail)
+
+    assert tasks.do_edge_browsing_streak(dashboard, minutes=1) == 0
+    assert activity.closed is True
+    assert dashboard.closed is False
+    assert historical.closed is False
+
+
+def test_edge_streak_current_activity_page_is_not_owned_or_closed(monkeypatch):
+    class Page:
+        url = "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
+        closed = False
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+        def locator(self, _selector):
+            raise AssertionError("已确认活动页时不应再次点击入口")
+
+    page = Page()
+
+    entry = tasks._prepare_edge_streak(page)
+
+    assert entry.activity_page is page
+    assert entry.created_pages == ()
+    assert entry.can_cleanup is False
+    assert page.closed is False
+
+
+def test_edge_streak_cleanup_preserves_current_page_and_history():
+    class Page:
+        def __init__(self, name):
+            self.name = name
+            self.closed = False
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+    current = Page("current")
+    historical = Page("historical")
+    owned = Page("owned")
+
+    tasks._close_edge_streak_pages(
+        current,
+        (current, historical, owned),
+        protected_pages={current, historical},
+    )
+
+    assert current.closed is False
+    assert historical.closed is False
+    assert owned.closed is True
+
+
+def test_prepare_edge_streak_ignores_historical_activity_page(monkeypatch):
+    class EmptyLocator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class StalePage:
+        url = "https://rewards.bing.com/promo/edge-browsing-streak?form=STALE"
+        closed = False
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+    class Page:
+        url = "https://rewards.bing.com/dashboard"
+        closed = False
+
+        def __init__(self):
+            self.stale = StalePage()
+            self.context = type("Context", (), {"pages": [self, self.stale]})()
+
+        def is_closed(self):
+            return self.closed
+
+        def locator(self, _selector):
+            return EmptyLocator()
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    page = Page()
+    monkeypatch.setattr(tasks, "safe_goto", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(tasks, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 1)
+
+    entry = tasks._prepare_edge_streak(page)
+
+    assert entry.activity_page is None
+    assert entry.created_pages == ()
+    assert page.stale.closed is False
+
+
 def test_edge_streak_returns_success_only_at_30_30(monkeypatch):
     values = iter([(0, 30)] + [(5, 30)] * 20)
     class Page:
@@ -789,7 +2527,10 @@ def test_edge_streak_returns_success_only_at_30_30(monkeypatch):
         def mouse(self):
             return None
     monkeypatch.setattr(tasks, "read_streak_progress", lambda page, label: next(values))
-    monkeypatch.setattr(tasks, "_open_edge_streak", lambda page: True)
+    monkeypatch.setattr(
+        tasks, "_prepare_edge_streak",
+        lambda target: tasks.EdgeStreakEntry(target, (), False),
+    )
     monkeypatch.setattr(tasks, "safe_goto", lambda *a, **k: None)
     assert tasks.do_edge_browsing_streak(Page(), minutes=1, poll_seconds=60) == 0
 
@@ -816,7 +2557,10 @@ def test_edge_streak_does_not_claim_success_before_target(monkeypatch):
         def wait_for_timeout(self, *_):
             return None
     monkeypatch.setattr(tasks, "read_streak_progress", lambda page, label: next(values))
-    monkeypatch.setattr(tasks, "_open_edge_streak", lambda page: True)
+    monkeypatch.setattr(
+        tasks, "_prepare_edge_streak",
+        lambda target: tasks.EdgeStreakEntry(target, (), False),
+    )
     monkeypatch.setattr(tasks, "safe_goto", lambda *a, **k: None)
     assert tasks.do_edge_browsing_streak(Page(), minutes=1, poll_seconds=60) == 0
 
@@ -866,6 +2610,125 @@ def test_run_account_invokes_streak_tasks(monkeypatch):
     ctx = type("C", (), {"new_page": lambda self: Page()})()
     main_module.run_account(None, ctx, "u", "p", True)
     assert calls == ["edge", "mobile", "webview"]
+
+
+def _run_account_with_mobile_result(monkeypatch, mobile_result, devices, webview_result=0):
+    import main as main_module
+    calls = []
+    claim_calls = []
+
+    class Page:
+        url = "https://rewards.bing.com/dashboard"
+
+        def goto(self, *_a, **_k):
+            pass
+
+        def wait_for_timeout(self, *_):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(main_module, "do_login", lambda *a, **k: True)
+    monkeypatch.setattr(main_module, "ensure_account", lambda *a, **k: True)
+    monkeypatch.setattr(main_module, "safe_goto", lambda *a, **k: None)
+    monkeypatch.setattr(main_module, "detect_risk_control", lambda _p: None)
+    monkeypatch.setattr(main_module, "parse_dashboard_data", lambda _p: {
+        "claimable_points": 0, "daily_set_items": [],
+        "daily_activities_done": 3, "daily_activities_total": 3,
+        "pc_search_done": 0, "pc_search_total": 0,
+    })
+    monkeypatch.setattr(main_module, "claim_available_points", lambda *a, **k: claim_calls.append("claim") or 0)
+    monkeypatch.setattr(main_module, "do_daily_set_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_dashboard_activities", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_daily_offer_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_point_punch_cards", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_edge_browsing_streak", lambda *a, **k: calls.append("edge") or 1)
+    monkeypatch.setattr(main_module, "mobile_checkin", lambda *a, **k: calls.append("mobile") or mobile_result)
+    monkeypatch.setattr(main_module, "list_android_devices", lambda: devices)
+    monkeypatch.setattr(main_module, "ENABLE_MOBILE_CLIENT", True)
+    monkeypatch.setattr(main_module, "run_rewards_desktop_task", lambda: calls.append("webview") or webview_result)
+    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.PROJECT_ROOT / "real-edge-profile")
+    monkeypatch.setattr(main_module, "DEFAULT_PC_SEARCHES", 0)
+    monkeypatch.setattr(main_module, "DEFAULT_MOBILE_SEARCHES", 0)
+    ctx = type("C", (), {"new_page": lambda self: Page()})()
+    return main_module.run_account(None, ctx, "u", "p", True), calls, claim_calls
+
+
+def test_run_account_skips_mobile_without_android_device(monkeypatch, capsys):
+    result, calls, claim_calls = _run_account_with_mobile_result(
+        monkeypatch, mobile_result=0, devices=[]
+    )
+
+    assert result is True
+    assert calls == ["edge", "mobile", "webview"]
+    assert len(claim_calls) == 4
+    assert "未连接 Android 设备，跳过必应应用签到" in capsys.readouterr().out
+
+
+def test_run_account_does_not_report_mobile_success_when_device_present(monkeypatch, capsys):
+    result, calls, claim_calls = _run_account_with_mobile_result(
+        monkeypatch, mobile_result=0, devices=["emulator-5554"]
+    )
+
+    assert result is False
+    assert calls == ["edge", "mobile"]
+    assert len(claim_calls) == 3
+    assert "必应应用签到未确认" in capsys.readouterr().out
+
+
+def test_run_account_skips_webview_when_uia_environment_unavailable(monkeypatch, capsys):
+    result, calls, claim_calls = _run_account_with_mobile_result(
+        monkeypatch,
+        mobile_result=1,
+        devices=[],
+        webview_result=clients.REWARDS_DESKTOP_UIA_UNAVAILABLE,
+    )
+
+    assert result is True
+    assert calls == ["edge", "mobile", "webview"]
+    assert len(claim_calls) == 4
+    assert "WebView UIA 不可用，跳过（不影响其他任务）" in capsys.readouterr().out
+
+
+def test_run_account_fails_on_actual_webview_task_error(monkeypatch, capsys):
+    result, calls, claim_calls = _run_account_with_mobile_result(
+        monkeypatch,
+        mobile_result=1,
+        devices=[],
+        webview_result=clients.REWARDS_DESKTOP_ERROR,
+    )
+
+    assert result is False
+    assert calls == ["edge", "mobile", "webview"]
+    assert len(claim_calls) == 3
+    assert "Rewards 桌面 WebView 任务执行失败，账号不报告成功" in capsys.readouterr().out
+
+
+def test_run_account_succeeds_when_webview_has_no_task(monkeypatch):
+    result, calls, claim_calls = _run_account_with_mobile_result(
+        monkeypatch,
+        mobile_result=1,
+        devices=[],
+        webview_result=clients.REWARDS_DESKTOP_NO_TASK,
+    )
+
+    assert result is True
+    assert calls == ["edge", "mobile", "webview"]
+    assert len(claim_calls) == 4
+
+
+def test_run_account_succeeds_when_webview_task_grows(monkeypatch):
+    result, calls, claim_calls = _run_account_with_mobile_result(
+        monkeypatch,
+        mobile_result=1,
+        devices=[],
+        webview_result=clients.REWARDS_DESKTOP_TASK_GROWN,
+    )
+
+    assert result is True
+    assert calls == ["edge", "mobile", "webview"]
+    assert len(claim_calls) == 4
 
 
 def test_run_account_skips_edge_streak_on_isolation_profile(monkeypatch):
@@ -985,6 +2848,93 @@ def test_rewards_desktop_state_parses_progress_and_uia_ready(monkeypatch):
     assert result["uia_ready"] is True
 
 
+def _fake_rewards_uia_output(monkeypatch, output):
+    monkeypatch.setattr(clients, "_rewards_desktop_hwnd", lambda: 123)
+    monkeypatch.setattr(clients, "REWARDS_DESKTOP_UIA_RESULT", config.PROJECT_ROOT / "tmp_missing_uia_result.txt")
+
+    class Result:
+        returncode = 0
+        stdout = output
+
+    monkeypatch.setattr(clients.subprocess, "run", lambda *a, **k: Result())
+
+
+def test_rewards_desktop_home_without_task_is_safe_noop(monkeypatch):
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\n"
+        "DOC=首页 – Microsoft Rewards\n"
+        "UIA_READY=1\n"
+        "TASK_STATE=no_task\n"
+        "SUCCESS=0\n",
+    )
+    result = clients.rewards_desktop_state()
+    assert result["available"] is True
+    assert result["uia_ready"] is True
+    assert result["task_state"] == "no_task"
+    assert result["error"] is False
+
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    assert clients.run_rewards_desktop_task() == 0
+
+
+def test_rewards_desktop_home_text_does_not_count_as_task_success(monkeypatch):
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\n"
+        "DOC=首页 – Microsoft Rewards\n"
+        "UIA_READY=1\n"
+        "TASK_STATE=no_task\n"
+        "Microsoft Edge 分钟: 30/30\n"
+        "SUCCESS=0\n",
+    )
+    result = clients.rewards_desktop_state()
+    assert result["task_progress"] is None
+    assert result["success"] is False
+    assert result["error"] is False
+
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    assert clients.run_rewards_desktop_task() == 0
+
+
+def test_rewards_desktop_missing_root_web_area_is_uia_unavailable(monkeypatch):
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\n"
+        "DOC=\n"
+        "UIA_READY=0\n"
+        "TASK_STATE=uia_unavailable\n"
+        "ERROR=RootWebArea not found\n",
+    )
+    result = clients.rewards_desktop_state()
+    assert result["available"] is True
+    assert result["uia_ready"] is False
+    assert result["task_state"] == "uia_unavailable"
+    assert result["error"] is True
+
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_UIA_UNAVAILABLE
+
+
+def test_rewards_desktop_run_returns_success_after_task_progress_growth(monkeypatch):
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\n"
+        "DOC=桌面奖励应用每周专属任务 – Microsoft Rewards\n"
+        "UIA_READY=1\n"
+        "TASK_STATE=task\n"
+        "TASK_PROGRESS=1/3\n"
+        "TASK_AFTER=2/3\n"
+        "SUCCESS=1\n",
+    )
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    assert clients.run_rewards_desktop_task() == 1
+
+
 def test_rewards_desktop_run_does_not_claim_success_without_growth(monkeypatch):
     monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
     monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
@@ -998,7 +2948,86 @@ def test_rewards_desktop_run_does_not_claim_success_without_growth(monkeypatch):
     assert clients.run_rewards_desktop_task() == 0
 
 
-def test_rewards_desktop_run_reports_uia_failure(monkeypatch):
+def test_rewards_desktop_parses_mouse_fallback_and_progress_growth(monkeypatch):
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\n"
+        "DOC=桌面奖励应用每周专属任务 – Microsoft Rewards\n"
+        "UIA_READY=1\n"
+        "TASK_STATE=task\n"
+        "TASK_ELEMENT_TYPE=ControlType.Hyperlink\n"
+        "TASK_RECT=100,200,300,40\n"
+        "TASK_INVOKE_MODE=mouse\n"
+        "INVOKE_FALLBACK=mouse\n"
+        "TASK_BEFORE=2/8\n"
+        "TASK_AFTER=3/8\n"
+        "SUCCESS=1\n",
+    )
+    result = clients.rewards_desktop_state()
+    assert result["task_before"] == "2/8"
+    assert result["task_after"] == "3/8"
+    assert result["task_progress"] == "3/8"
+    assert result["task_element_type"] == "ControlType.Hyperlink"
+    assert result["task_rect"] == "100,200,300,40"
+    assert result["task_invoke_mode"] == "mouse"
+    assert result["invoke_fallback"] == "mouse"
+    assert result["success"] is True
+
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_TASK_GROWN
+
+
+def test_rewards_desktop_mouse_fallback_failure_remains_error(monkeypatch):
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\n"
+        "DOC=桌面奖励应用每周专属任务 – Microsoft Rewards\n"
+        "UIA_READY=1\n"
+        "TASK_STATE=task\n"
+        "TASK_ELEMENT_TYPE=ControlType.Hyperlink\n"
+        "TASK_RECT=100,200,300,40\n"
+        "TASK_INVOKE_MODE=none\n"
+        "INVOKE_FALLBACK=none\n"
+        "TASK_BEFORE=2/8\n"
+        "TASK_AFTER=2/8\n"
+        "TASK_ERROR=weekly_item_not_invokable\n"
+        "SUCCESS=0\n",
+    )
+    result = clients.rewards_desktop_state()
+    assert result["task_state"] == "error"
+    assert result["error"] is True
+    assert result["success"] is False
+
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+
+
+def test_rewards_desktop_rejects_non_hyperlink_task_item(monkeypatch):
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\n"
+        "DOC=桌面奖励应用每周专属任务 – Microsoft Rewards\n"
+        "UIA_READY=1\n"
+        "TASK_STATE=task\n"
+        "TASK_ELEMENT_TYPE=ControlType.Text\n"
+        "TASK_RECT=100,200,300,40\n"
+        "TASK_BEFORE=2/8\n"
+        "TASK_AFTER=3/8\n"
+        "SUCCESS=1\n",
+    )
+    result = clients.rewards_desktop_state()
+    assert result["task_state"] == "error"
+    assert result["error"] is True
+    assert result["success"] is False
+
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+
+
+def test_rewards_desktop_run_reports_uia_environment_unavailable(monkeypatch):
     monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
     monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
     monkeypatch.setattr(clients, "_rewards_uia", lambda mode="run": {
@@ -1008,7 +3037,22 @@ def test_rewards_desktop_run_reports_uia_failure(monkeypatch):
         "uia_ready": False,
         "output": "",
     })
-    assert clients.run_rewards_desktop_task() == -1
+    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_UIA_UNAVAILABLE
+
+
+def test_rewards_desktop_run_reports_actual_task_error(monkeypatch):
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(clients, "_rewards_uia", lambda mode="run": {
+        "available": True,
+        "task_progress": None,
+        "success": False,
+        "uia_ready": True,
+        "task_state": "task",
+        "error": True,
+        "output": "TASK_ERROR=click failed",
+    })
+    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
 
 
 def test_rewards_desktop_run_returns_success_after_progress_growth(monkeypatch):

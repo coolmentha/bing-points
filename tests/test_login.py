@@ -311,15 +311,231 @@ if __name__ == "__main__":
 
 class _IdentityPage:
     url = "https://rewards.bing.com/dashboard"
+
     def __init__(self, html):
         self.html = html
+
     def content(self):
         return self.html
+
+    def evaluate(self, *_args, **_kwargs):
+        return None
+
+
+# 脱敏的 Rewards RSC 账号块：没有 signInName，只能从转义后的
+# className="pii truncate" 与 children 结构中读取合成邮箱。
+RSC_IDENTITY_HTML = (
+    '<script>self.__next_f.push([1,"'
+    '\\"className\\":\\"pii truncate\\",'
+    '\\"children\\":\\"rewards.user@example.com\\"'
+    '"])</script>'
+)
 
 
 def test_get_logged_in_identity_reads_sign_in_name():
     page = _IdentityPage('<script>{"signInName":"User.Name@example.com"}</script>')
     assert login.get_logged_in_identity(page) == "user.name@example.com"
+
+
+def test_get_logged_in_identity_reads_escaped_rsc_account_block():
+    """signInName 缺失时，应能从真实 RSC 转义账号块中提取合成邮箱。"""
+    page = _IdentityPage(RSC_IDENTITY_HTML)
+    assert login.get_logged_in_identity(page) == "rewards.user@example.com"
+
+
+def test_wait_for_identity_parses_rsc_after_initial_empty_html():
+    """RSC 账号块异步写入 DOM：首次 HTML 无身份，后续 HTML 应走真实解析路径。"""
+    class AsyncRscPage(_IdentityPage):
+        def __init__(self):
+            super().__init__("<div>loading</div>")
+            self.waits = []
+
+        def wait_for_timeout(self, ms):
+            self.waits.append(ms)
+            self.html = RSC_IDENTITY_HTML
+
+    page = AsyncRscPage()
+
+    assert login._wait_for_logged_in_identity(page, timeout_ms=1000, interval_ms=100) == "rewards.user@example.com"
+    assert page.waits == [100]
+
+
+def test_wait_for_identity_returns_none_after_timeout(monkeypatch):
+    """身份始终不出现时应有上限地收敛，不能无限轮询。"""
+    class ReadableEmptyPage(_IdentityPage):
+        def __init__(self):
+            super().__init__("<div>loading</div>")
+            self.waits = []
+            self.content_calls = 0
+
+        def content(self):
+            self.content_calls += 1
+            return self.html
+
+        def wait_for_timeout(self, ms):
+            self.waits.append(ms)
+
+    page = ReadableEmptyPage()
+    times = iter([0.0, 0.4, 0.9, 1.1])
+    monkeypatch.setattr(login.time, "monotonic", lambda: next(times))
+
+    assert login._wait_for_logged_in_identity(page, timeout_ms=1000, interval_ms=500) is None
+    assert page.content_calls == 3
+    assert page.waits == [500, 100]
+
+
+def test_wait_for_identity_stops_immediately_when_page_closed():
+    """页面已关闭时不应继续高频读取内容，应立即安全返回。"""
+    class ClosedPage(_IdentityPage):
+        def __init__(self):
+            super().__init__("<div>loading</div>")
+            self.waits = []
+            self.content_calls = 0
+
+        def is_closed(self):
+            return True
+
+        def content(self):
+            self.content_calls += 1
+            return self.html
+
+        def wait_for_timeout(self, ms):
+            self.waits.append(ms)
+
+    page = ClosedPage()
+
+    assert login._wait_for_logged_in_identity(page, timeout_ms=1000, interval_ms=100) is None
+    assert page.content_calls == 0
+    assert page.waits == []
+
+
+def test_wait_for_identity_backs_off_and_caps_read_errors(monkeypatch):
+    """连续读取异常应按退避间隔重试，并在有限次数后返回，不能耗尽整个超时窗口。"""
+    class ReadErrorPage(_IdentityPage):
+        def __init__(self):
+            super().__init__("<div>loading</div>")
+            self.waits = []
+            self.content_calls = 0
+
+        def is_closed(self):
+            return False
+
+        def content(self):
+            self.content_calls += 1
+            raise RuntimeError("page context unavailable")
+
+        def wait_for_timeout(self, ms):
+            self.waits.append(ms)
+
+    page = ReadErrorPage()
+    monkeypatch.setattr(login, "IDENTITY_MAX_CONSECUTIVE_READ_ERRORS", 3, raising=False)
+    monkeypatch.setattr(login, "IDENTITY_READ_ERROR_BACKOFF_MS", 1000, raising=False)
+
+    assert login._wait_for_logged_in_identity(page, timeout_ms=15000, interval_ms=500) is None
+    assert page.content_calls == 3
+    assert page.waits == [1000, 1000]
+
+
+def test_wait_for_identity_resets_error_count_after_readable_empty(monkeypatch):
+    """交替出现读取异常和可读空页面时，连续异常计数应重置，最终由总超时收敛。"""
+    class AlternatingReadPage(_IdentityPage):
+        def __init__(self):
+            super().__init__("<div>loading</div>")
+            self.waits = []
+            self.content_calls = 0
+
+        def is_closed(self):
+            return False
+
+        def content(self):
+            self.content_calls += 1
+            if self.content_calls % 2 == 1:
+                raise RuntimeError("intermittent read failure")
+            return self.html
+
+        def wait_for_timeout(self, ms):
+            self.waits.append(ms)
+
+    page = AlternatingReadPage()
+    times = iter([0.0, 0.6, 1.2, 1.8, 2.4, 3.1])
+    monkeypatch.setattr(login, "IDENTITY_MAX_CONSECUTIVE_READ_ERRORS", 2, raising=False)
+    monkeypatch.setattr(login, "IDENTITY_READ_ERROR_BACKOFF_MS", 1000, raising=False)
+    monkeypatch.setattr(login.time, "monotonic", lambda: next(times))
+
+    assert login._wait_for_logged_in_identity(page, timeout_ms=3000, interval_ms=500) is None
+    assert page.content_calls == 5
+    assert page.waits == [1000, 500, 1000, 500]
+
+
+def test_ensure_account_logs_identity_failure_context(monkeypatch, capsys):
+    """身份缺失时应输出 URL、标题和登录控件状态，便于区分时序与登录页。"""
+    page = _IdentityPage("<div>no identity</div>")
+    page.title = lambda: "首页 – Microsoft Rewards"
+    monkeypatch.setattr(login, "_wait_for_logged_in_identity", lambda _page: None)
+    monkeypatch.setattr(login, "do_login", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not login")))
+
+    assert login.ensure_account(page, "target@example.com", "pw") is False
+    out = capsys.readouterr().out
+    assert "无法读取当前账号身份" in out
+    assert "rewards.bing.com/dashboard" in out
+    assert "首页 – Microsoft Rewards" in out
+    assert "登录控件=未出现" in out
+
+
+def test_ensure_account_redacts_sensitive_url_parts_in_failure_context(monkeypatch, capsys):
+    """失败诊断只保留域名和路径，不能把 OAuth 查询参数或片段写进日志。"""
+    page = _IdentityPage("<div>no identity</div>")
+    page.url = (
+        "https://rewards.bing.com/dashboard?"
+        "code=oauth-code-secret&state=state-secret&session=session-secret"
+        "#fragment-secret"
+    )
+    monkeypatch.setattr(login, "_wait_for_logged_in_identity", lambda _page: None)
+    monkeypatch.setattr(login, "do_login", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not login")))
+
+    assert login.ensure_account(page, "target@example.com", "pw") is False
+    out = capsys.readouterr().out
+    assert "https://rewards.bing.com/dashboard" in out
+    for sensitive in ("oauth-code-secret", "state-secret", "session-secret", "fragment-secret"):
+        assert sensitive not in out
+
+
+@pytest.mark.parametrize(
+    "diagnostic_url",
+    (
+        "/dashboard?code=relative-code-secret&state=relative-state-secret",
+        "javascript:alert('session-secret')",
+        "http://[broken?code=parse-error-secret",
+    ),
+)
+def test_ensure_account_fails_closed_for_unsafe_diagnostic_urls(monkeypatch, capsys, diagnostic_url):
+    """相对 URL、非 HTTP(S) 和解析异常 URL 应安全降级，不能中断失败处理。"""
+    page = _IdentityPage("<div>no identity</div>")
+    page.url = diagnostic_url
+    monkeypatch.setattr(login, "_wait_for_logged_in_identity", lambda _page: None)
+    monkeypatch.setattr(login, "do_login", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not login")))
+
+    assert login.ensure_account(page, "target@example.com", "pw") is False
+    out = capsys.readouterr().out
+    assert "无法读取当前账号身份" in out
+    assert "URL=(无效)" in out
+    assert "secret" not in out
+
+
+def test_ensure_account_fails_closed_when_failure_context_raises(monkeypatch, capsys):
+    """诊断上下文采集自身失败时，仍应安全返回 False，不中断账号流程。"""
+    page = _IdentityPage("<div>no identity</div>")
+    monkeypatch.setattr(login, "_wait_for_logged_in_identity", lambda _page: None)
+    monkeypatch.setattr(
+        login,
+        "_identity_failure_context",
+        lambda _page: (_ for _ in ()).throw(RuntimeError("context unavailable")),
+    )
+    monkeypatch.setattr(login, "do_login", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not login")))
+
+    assert login.ensure_account(page, "target@example.com", "pw") is False
+    out = capsys.readouterr().out
+    assert "无法读取当前账号身份" in out
 
 
 def test_ensure_account_accepts_matching_identity(monkeypatch):

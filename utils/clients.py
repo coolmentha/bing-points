@@ -20,6 +20,12 @@ from utils.config import (
 ADB_TIMEOUT = 15
 UI_DUMP_PATH = "/sdcard/window_dump.xml"
 
+# Rewards 桌面任务返回值：环境不可用与真实任务失败必须分开。
+REWARDS_DESKTOP_ERROR = -1
+REWARDS_DESKTOP_UIA_UNAVAILABLE = -2
+REWARDS_DESKTOP_NO_TASK = 0
+REWARDS_DESKTOP_TASK_GROWN = 1
+
 
 def _adb(*args, timeout: int = ADB_TIMEOUT):
     adb = Path(ADB_PATH)
@@ -309,6 +315,22 @@ def _rewards_desktop_hwnd() -> int:
         return 0
 
 
+def _last_output_value(output: str, key: str):
+    prefix = key + "="
+    value = None
+    for line in output.splitlines():
+        if line.startswith(prefix):
+            value = line.split("=", 1)[1].strip() or None
+    return value
+
+
+def _output_progress(value):
+    if not value:
+        return None
+    match = re.search(r"(\d+)\s*/\s*(\d+)", value)
+    return f"{match.group(1)}/{match.group(2)}" if match else None
+
+
 def rewards_desktop_available() -> bool:
     return bool(_rewards_desktop_hwnd())
 
@@ -358,19 +380,44 @@ def _rewards_uia(mode: str = "state") -> dict:
             output = REWARDS_DESKTOP_UIA_RESULT.read_text(encoding="utf-8-sig")
     except OSError:
         pass
-    progress = None
-    for line in output.splitlines():
-        if line.startswith("TASK_PROGRESS=") or line.startswith("TASK_AFTER="):
-            match = re.search(r"(\d+)/(\d+)", line)
-            if match:
-                progress = f"{match.group(1)}/{match.group(2)}"
+    task_progress = _output_progress(_last_output_value(output, "TASK_PROGRESS"))
+    task_before = _output_progress(_last_output_value(output, "TASK_BEFORE"))
+    task_after = _output_progress(_last_output_value(output, "TASK_AFTER"))
+    progress = task_after or task_before or task_progress
+    task_state = _last_output_value(output, "TASK_STATE")
+    task_element_type = _last_output_value(output, "TASK_ELEMENT_TYPE")
+    task_rect = _last_output_value(output, "TASK_RECT")
+    task_invoke_mode = _last_output_value(output, "TASK_INVOKE_MODE")
+    invoke_fallback = _last_output_value(output, "INVOKE_FALLBACK")
+    ready_line = next((line for line in output.splitlines() if line.startswith("UIA_READY=")), "")
     doc_line = next((line for line in output.splitlines() if line.startswith("DOC=")), "")
+    legacy_ready = bool(progress or (doc_line and doc_line != "DOC="))
+    uia_ready = ready_line == "UIA_READY=1" or (not ready_line and legacy_ready)
+    if task_state is None and uia_ready and progress:
+        task_state = "task"
+    error = "TASK_ERROR=" in output or "ERROR=" in output
+    if task_state == "task" and task_element_type and task_element_type != "ControlType.Hyperlink":
+        error = True
+    if error and task_state not in ("no_task", "uia_unavailable"):
+        task_state = "error"
+    success = "SUCCESS=1" in output and not error
+    if task_before and task_after:
+        before_count, after_count = (int(part) for part in task_before.split("/"))
+        current_after_count = int(task_after.split("/")[0])
+        success = success and current_after_count > before_count
     return {
         "available": "AVAILABLE=1" in output,
         "task_progress": progress,
-        "success": "SUCCESS=1" in output,
-        "uia_ready": bool(progress or (doc_line and doc_line != "DOC=")),
-        "error": "TASK_ERROR=" in output or "ERROR=" in output,
+        "task_before": task_before,
+        "task_after": task_after,
+        "task_element_type": task_element_type,
+        "task_rect": task_rect,
+        "task_invoke_mode": task_invoke_mode,
+        "invoke_fallback": invoke_fallback,
+        "success": success,
+        "uia_ready": uia_ready,
+        "task_state": task_state,
+        "error": error,
         "output": output,
     }
 
@@ -381,25 +428,33 @@ def rewards_desktop_state() -> dict:
 
 
 def run_rewards_desktop_task() -> int:
-    """推进一个桌面应用专属任务：1=增长，0=无启用任务，-1=运行异常。"""
+    """推进一个桌面应用专属任务。
+
+    返回 ``REWARDS_DESKTOP_TASK_GROWN``、``REWARDS_DESKTOP_NO_TASK``、
+    ``REWARDS_DESKTOP_ERROR`` 或 ``REWARDS_DESKTOP_UIA_UNAVAILABLE``。
+    最后一项表示当前进程无法访问桌面 UIA，不代表账号业务失败。
+    """
     if not ENABLE_REWARDS_DESKTOP:
-        return 0
+        return REWARDS_DESKTOP_NO_TASK
     if not rewards_desktop_available() and not open_rewards_desktop():
-        print("  未检测到 Rewards 桌面应用")
-        return -1
+        print("  未检测到 Rewards 桌面应用，WebView UIA 不可用")
+        return REWARDS_DESKTOP_UIA_UNAVAILABLE
     result = _rewards_uia("run")
     if result.get("available") and not result.get("uia_ready"):
         print("  WebView 完整 UIA 节点不可用；请通过 start.bat/计划任务以正常桌面权限运行")
-        return -1
+        return REWARDS_DESKTOP_UIA_UNAVAILABLE
     if not result.get("available"):
         print("  Rewards 桌面应用 UIA 不可用")
-        return -1
+        return REWARDS_DESKTOP_UIA_UNAVAILABLE
+    if result.get("task_state") == "no_task" and not result.get("error"):
+        print("  未找到已启用的 WebView 每周任务，跳过")
+        return REWARDS_DESKTOP_NO_TASK
     if result.get("error"):
         print("  WebView 任务定位或点击失败，账号不报告成功")
-        return -1
+        return REWARDS_DESKTOP_ERROR
     print(f"  WebView 任务进度: {result.get('task_progress') or '未读取到'}")
     if result.get("success"):
         print("  WebView 任务本次进度已增长")
-        return 1
+        return REWARDS_DESKTOP_TASK_GROWN
     print("  本次没有可推进的 WebView 任务")
-    return 0
+    return REWARDS_DESKTOP_NO_TASK

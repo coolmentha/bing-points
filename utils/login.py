@@ -1,5 +1,14 @@
 """Microsoft OAuth 登录流程"""
+import math
+import time
+from urllib.parse import urlsplit, urlunsplit
 
+
+# 账号身份由 Next.js RSC 异步写入 DOM，不能只在固定等待后读取一次。
+IDENTITY_WAIT_TIMEOUT_MS = 15000
+IDENTITY_POLL_INTERVAL_MS = 500
+IDENTITY_MAX_CONSECUTIVE_READ_ERRORS = 3
+IDENTITY_READ_ERROR_BACKOFF_MS = 1000
 
 # 凭据选择页（"使用另一种方式登录"）上"使用密码"选项的候选定位器。
 # 设备上存在 passkey/Windows Hello 时，login.live.com 会跳过邮箱输入，
@@ -282,18 +291,18 @@ def do_login(page, username: str, password: str) -> bool:
 LOGIN_URL = "https://login.live.com/"
 
 
-def get_logged_in_identity(page) -> str | None:
-    """读取当前 Rewards 账号邮箱（signInName 或账号块的 RSC 数据）。"""
+def _read_logged_in_identity(page) -> tuple[str | None, bool]:
+    """读取身份并区分“暂时没有身份”和“页面内容读取失败”。"""
     import re
     try:
         html = page.content()
     except Exception:
-        return None
+        return None, False
 
     # 旧版/部分页面直接输出 signInName。
     match = re.search(r'"signInName"\s*:\s*"([^"]+)"', html, re.I)
     if match and "@" in match.group(1):
-        return match.group(1).strip().lower()
+        return match.group(1).strip().lower(), True
 
     # 新版 RSC 账号块里的 JSON 引号是转义形式：
     # \"className\":\"pii truncate\",\"children\":\"user@example.com\"
@@ -304,7 +313,7 @@ def get_logged_in_identity(page) -> str | None:
         re.I,
     )
     if match:
-        return match.group(1).strip().lower()
+        return match.group(1).strip().lower(), True
 
     # 已经渲染 MeControl 弹窗时，优先读明确的账号元素。
     try:
@@ -319,13 +328,117 @@ def get_logged_in_identity(page) -> str | None:
         }""")
     except Exception:
         identity = None
-    return identity.strip().lower() if isinstance(identity, str) and "@" in identity else None
+    if isinstance(identity, str) and "@" in identity:
+        return identity.strip().lower(), True
+    return None, True
+
+
+def get_logged_in_identity(page) -> str | None:
+    """读取当前 Rewards 账号邮箱（signInName 或账号块的 RSC 数据）。"""
+    identity, _ = _read_logged_in_identity(page)
+    return identity
+
+
+def _page_is_closed(page) -> bool:
+    """页面关闭探测失败时不做假设，交由内容读取异常上限兜底。"""
+    try:
+        return bool(page.is_closed())
+    except Exception:
+        return False
+
+
+def _wait_for_logged_in_identity(
+    page,
+    timeout_ms: int = IDENTITY_WAIT_TIMEOUT_MS,
+    interval_ms: int = IDENTITY_POLL_INTERVAL_MS,
+) -> str | None:
+    """等待 Rewards 异步写入账号身份，超时或上下文失效时返回 None。"""
+    deadline = time.monotonic() + max(timeout_ms, 0) / 1000
+    consecutive_read_errors = 0
+    max_read_errors = max(int(IDENTITY_MAX_CONSECUTIVE_READ_ERRORS), 1)
+    read_error_backoff_ms = max(int(IDENTITY_READ_ERROR_BACKOFF_MS), 1)
+
+    while True:
+        if _page_is_closed(page):
+            return None
+
+        current, read_ok = _read_logged_in_identity(page)
+        if current is not None:
+            return current
+        if read_ok:
+            consecutive_read_errors = 0
+        else:
+            consecutive_read_errors += 1
+            if consecutive_read_errors >= max_read_errors:
+                return None
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        next_interval_ms = interval_ms if read_ok else read_error_backoff_ms
+        delay_ms = max(1, min(next_interval_ms, math.ceil(remaining * 1000)))
+        try:
+            page.wait_for_timeout(delay_ms)
+        except Exception:
+            if _page_is_closed(page):
+                return None
+            time.sleep(delay_ms / 1000)
+
+
+def _redact_diagnostic_url(url) -> str:
+    """仅保留 HTTP(S) 的 scheme、host、path，避免泄露查询参数和片段。"""
+    try:
+        parts = urlsplit(str(url))
+        scheme = parts.scheme.lower()
+        if scheme not in ("http", "https"):
+            return "(无效)"
+        hostname = parts.hostname
+        if not hostname:
+            return "(无效)"
+        host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+        port = parts.port
+        if port is not None:
+            host = f"{host}:{port}"
+        return urlunsplit((scheme, host, parts.path or "/", "", ""))[:160]
+    except (AttributeError, TypeError, ValueError):
+        return "(无效)"
+
+
+def _identity_failure_context(page) -> str:
+    """采集不包含账号信息的失败上下文，便于区分登录页和异步渲染。"""
+    try:
+        url = _redact_diagnostic_url(page.url)
+    except Exception:
+        url = "(无效)"
+    try:
+        title = str(page.title())[:80]
+    except Exception:
+        title = "(未知)"
+    try:
+        has_login_form = _first_visible(
+            page,
+            ("#usernameEntry", "input[name='loginfmt']", "input[type='email']", "#idSIButton9"),
+        ) is not None
+    except Exception:
+        has_login_form = False
+    return f"URL={url} 标题={title} 登录控件={'已出现' if has_login_form else '未出现'}"
+
+
+def _log_identity_failure_context(page) -> None:
+    """诊断信息只能辅助排查，采集失败不得改变安全失败语义。"""
+    try:
+        context = _identity_failure_context(page)
+    except Exception:
+        context = "URL=(未知) 标题=(未知) 登录控件=未知"
+    print(f"    {context}")
+
 
 def ensure_account(page, username: str, password: str) -> bool:
     """确认页面登录的是目标账号；无法读取身份时安全停止，不猜测。"""
-    current = get_logged_in_identity(page)
+    current = _wait_for_logged_in_identity(page)
     if current is None:
-        print("  无法读取当前账号 signInName，安全停止，不擅自切换账号")
+        print("  无法读取当前账号身份，安全停止，不擅自切换账号")
+        _log_identity_failure_context(page)
         return False
     if current == username.lower():
         return True
@@ -337,8 +450,9 @@ def ensure_account(page, username: str, password: str) -> bool:
         pass
     if not do_login(page, username, password):
         return False
-    verified = get_logged_in_identity(page)
+    verified = _wait_for_logged_in_identity(page)
     if verified != username.lower():
         print("  登录后仍无法确认目标账号，安全停止")
+        _log_identity_failure_context(page)
         return False
     return True

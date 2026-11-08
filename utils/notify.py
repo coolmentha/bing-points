@@ -9,9 +9,11 @@
 import os
 import smtplib
 import ssl
+from dataclasses import dataclass
 from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import formataddr
+from pathlib import Path
 
 from utils.config import ENV_PATH
 
@@ -79,18 +81,45 @@ def build_subject(exit_code: int, account_summary: str = "") -> str:
     return subject
 
 
-def build_body(exit_code: int, log_text: str = "", tail_lines: int = 40) -> str:
-    """正文：结论 + 退出码 + 日志尾部（排查主要靠这段）"""
+@dataclass(frozen=True)
+class RunLog:
+    """一次运行的通知快照，避免发送时误读后来实例的日志。"""
+
+    text: str = ""
+    run_info: dict | None = None
+
+
+def _coerce_run_log(log: str | RunLog | None) -> RunLog:
+    if isinstance(log, RunLog):
+        return log
+    return RunLog(str(log or ""))
+
+
+def build_body(
+    exit_code: int, log_text: str | RunLog = "", tail_lines: int = 40
+) -> str:
+    """正文：本次运行身份 + 结论 + 日志尾部。"""
+    run_log = _coerce_run_log(log_text)
+    info = run_log.run_info or {}
     reason = EXIT_CODE_REASONS.get(exit_code, "未知错误")
+    pid = info.get("pid", "未知")
+    log_path = info.get("log_path", "未知")
+    started_at = info.get("started_at", "未知")
+    log_mtime = info.get("log_mtime", "未知")
     lines = [
         "BingPoints 无人值守运行失败。",
+        "",
+        f"本次运行 PID：{pid}",
+        f"本次运行日志：{log_path}",
+        f"运行开始时间：{started_at}",
+        f"日志最后修改时间：{log_mtime}",
         "",
         f"退出码：{exit_code}",
         f"原因：{reason}",
         "",
         "---- 日志尾部 ----",
     ]
-    tail = [ln for ln in log_text.strip().splitlines() if ln.strip()]
+    tail = [ln for ln in run_log.text.strip().splitlines() if ln.strip()]
     if tail:
         lines.extend(tail[-tail_lines:])
     else:
@@ -98,7 +127,7 @@ def build_body(exit_code: int, log_text: str = "", tail_lines: int = 40) -> str:
     lines += [
         "",
         "---- 排查建议 ----",
-        "- 完整日志见项目 logs 目录下最新的 run_*.log",
+        f"- 完整日志：{log_path}",
         "- 看日志里的“会话号”：0=服务会话(无窗口站)，非0=用户桌面会话",
         "- 登录失败多为登录态失效：检查 tmp_playwright_profile 是否被删除",
     ]
@@ -133,12 +162,10 @@ def send_mail(cfg: dict, subject: str, body: str, timeout: int = 20) -> None:
 
 
 def read_log_tail(log_path=None, tail_lines: int = 40) -> str:
-    """读取日志尾部；文件不存在/读不了都返回空串（不能因为读日志而报错）"""
+    """读取指定日志尾部；文件不存在/读不了返回空串，不做最新文件猜测。"""
     if log_path is None:
         return ""
     try:
-        from pathlib import Path
-
         path = Path(log_path)
         if not path.exists():
             return ""
@@ -148,7 +175,9 @@ def read_log_tail(log_path=None, tail_lines: int = 40) -> str:
         return ""
 
 
-def notify_failure(exit_code: int, log_text: str = "", logger=print) -> bool:
+def notify_failure(
+    exit_code: int, log_text: str | RunLog = "", logger=print
+) -> bool:
     """失败时推送通知。
 
     返回是否真的发出了邮件。任何异常都只记日志、返回 False，

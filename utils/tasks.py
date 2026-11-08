@@ -1,11 +1,43 @@
 """Rewards 任务执行：领积分 / 每日任务 / 每日活动 / 日常任务"""
 import heapq
 import html as html_lib
+import json
+import math
 import random
 import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlsplit
 
 from utils.browser import _random_scroll, random_sleep, safe_goto
-from utils.config import REWARDS_DASHBOARD, REWARDS_EARN_PAGE
+from utils.config import EDGE_USER_DATA_DIR, REWARDS_DASHBOARD, REWARDS_EARN_PAGE
+
+
+EDGE_STREAK_LAUNCH_URL = "https://www.microsoft.com/edge/launch/rewards-browsing-streak1"
+EDGE_STREAK_REDIRECT_TIMEOUT_MS = 15000
+EDGE_STREAK_POLL_INTERVAL_MS = 500
+EDGE_STREAK_ACTIVATION_TEXT = "开始在 Edge 上浏览"
+EDGE_STREAK_ACTIVATION_POLL_MS = 500
+EDGE_STREAK_ACTIVATION_TIMEOUT_MS = 10000
+
+
+@dataclass(frozen=True)
+class EdgeStreakEntry:
+    """Edge 活动入口详情；只允许清理本次新建且仍可追踪的页面。"""
+
+    activity_page: object | None
+    created_pages: tuple
+    can_cleanup: bool
+
+
+@dataclass(frozen=True)
+class EdgeStreakActivation:
+    """点击激活链接后的明确结果；未确认新增 Bing 页时不回退旧页面。"""
+
+    browsing_page: object | None
+    created_pages: tuple
+    activated: bool
 
 
 MICROSOFT_HOSTS = (
@@ -766,38 +798,336 @@ def read_streak_progress(page, label: str):
     return int(match.group(1)), int(match.group(2))
 
 
-def _open_edge_streak(page) -> bool:
-    """从新版面板打开 Edge 浏览活动，返回是否进入官方活动页。"""
-    current_url = (getattr(page, "url", "") or "").lower()
-    if "rewards.bing.com/promo/edge-browsing-streak" in current_url:
+def _load_json_object(path: Path) -> dict | None:
+    """只读解析 JSON 对象；缺失、锁定或损坏时返回 None，不触碰 profile。"""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _has_account_value(value) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, dict, set)):
+        return bool(value)
+    return bool(value)
+
+
+def _edge_profile_directories(profile_dir: Path) -> list[Path]:
+    """定位 Default/Profile N；也兼容直接传入单个 profile 目录。"""
+    directories = []
+    if re.match(r"^(default|profile \d+)$", profile_dir.name, re.I):
+        directories.append(profile_dir)
+    try:
+        children = list(profile_dir.iterdir())
+    except OSError:
+        children = []
+    for child in children:
+        try:
+            if child.is_dir() and re.match(r"^(default|profile \d+)$", child.name, re.I):
+                directories.append(child)
+        except OSError:
+            continue
+    return directories
+
+
+def edge_browser_profile_logged_in(profile_dir=None) -> bool:
+    """只读判断 Edge 浏览器 profile 是否有登录账号证据。
+
+    网页 Rewards 已登录不代表 Edge 浏览器 profile 已登录。只有 Local State
+    的 user_name 或 profile 的 Preferences.account_info 出现非空账号信息时
+    才返回 True；文件缺失、锁定、JSON 损坏等一律按安全未知处理为 False。
+    """
+    root = Path(profile_dir) if profile_dir is not None else Path(EDGE_USER_DATA_DIR)
+    profile_dirs = _edge_profile_directories(root)
+    if not profile_dirs and re.match(r"^(default|profile \d+)$", root.name, re.I):
+        profile_dirs = [root]
+
+    local_state_path = root / "Local State"
+    if not local_state_path.is_file() and root.name.lower() != "user data":
+        local_state_path = root.parent / "Local State"
+    local_state = _load_json_object(local_state_path)
+    if local_state:
+        info_cache = local_state.get("profile", {}).get("info_cache", {})
+        if isinstance(info_cache, dict):
+            for entry in info_cache.values():
+                if isinstance(entry, dict) and _has_account_value(entry.get("user_name")):
+                    return True
+
+    for directory in profile_dirs:
+        preferences = _load_json_object(directory / "Preferences")
+        if preferences and _has_account_value(preferences.get("account_info")):
+            return True
+    return False
+
+
+def _is_edge_streak_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url or "")
+        return (
+            parsed.scheme.lower() == "https"
+            and (parsed.hostname or "").lower() == "rewards.bing.com"
+            and parsed.port in (None, 443)
+            and parsed.path == "/promo/edge-browsing-streak"
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _page_is_closed(page) -> bool:
+    try:
+        is_closed = getattr(page, "is_closed", None)
+        return bool(is_closed()) if callable(is_closed) else False
+    except Exception:
         return True
+
+
+def _edge_streak_targets(page, existing_pages=None) -> list:
+    """返回当前页和本次点击新增的标签页，绝不扫描历史标签页。"""
+    targets = [page]
+    try:
+        pages = list(page.context.pages)
+    except Exception:
+        return targets
+    for item in pages:
+        if item is page:
+            continue
+        if existing_pages is not None and item in existing_pages:
+            continue
+        if item not in targets:
+            targets.append(item)
+    return targets
+
+
+def _wait_for_edge_streak_target(
+    page,
+    targets,
+    timeout_ms: int,
+    existing_pages=None,
+    include_new_pages: bool = True,
+) -> object | None:
+    """等待当前页或本次新页跳转到活动页；坏页不能中断其他页面轮询。"""
+    deadline = time.monotonic() + max(timeout_ms, 0) / 1000
+    known_targets = list(targets)
+    while True:
+        for target in known_targets:
+            if _page_is_closed(target):
+                continue
+            try:
+                url = target.url
+            except Exception:
+                continue
+            if _is_edge_streak_url(url):
+                return target
+        if include_new_pages:
+            for target in _edge_streak_targets(page, existing_pages):
+                if target not in known_targets:
+                    known_targets.append(target)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        delay_ms = max(1, min(EDGE_STREAK_POLL_INTERVAL_MS, math.ceil(remaining * 1000)))
+        try:
+            page.wait_for_timeout(delay_ms)
+        except Exception:
+            time.sleep(delay_ms / 1000)
+
+
+def _is_edge_activation_url(url: str) -> bool:
+    """仅接受 Bing 首页激活跳转，避免把任意页面当作激活页。"""
+    try:
+        parsed = urlsplit(url or "")
+        return (
+            parsed.scheme.lower() == "https"
+            and (parsed.hostname or "").lower() in ("bing.com", "www.bing.com", "cn.bing.com")
+            and parsed.port in (None, 443)
+            and parsed.path in ("", "/")
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _new_pages(page, existing_pages) -> list:
+    """只返回点击后新增页面；快照不可用时返回空，不扫描历史页。"""
+    try:
+        pages = list(page.context.pages)
+    except Exception:
+        return []
+    return [
+        item for item in pages
+        if item is not page and item not in existing_pages
+    ]
+
+
+def _wait_for_activation_page(
+    anchor_page,
+    existing_pages,
+    timeout_ms: int,
+) -> object | None:
+    """等待本次点击新增的 Bing 激活页；历史标签页永远不参与。"""
+    deadline = time.monotonic() + max(timeout_ms, 0) / 1000
+    known_pages = []
+    while True:
+        for target in _new_pages(anchor_page, existing_pages):
+            if target not in known_pages:
+                known_pages.append(target)
+        for target in known_pages:
+            if _page_is_closed(target):
+                continue
+            try:
+                if _is_edge_activation_url(target.url):
+                    return target
+            except Exception:
+                continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        delay_ms = max(1, min(EDGE_STREAK_ACTIVATION_POLL_MS, math.ceil(remaining * 1000)))
+        try:
+            anchor_page.wait_for_timeout(delay_ms)
+        except Exception:
+            time.sleep(delay_ms / 1000)
+
+
+def _activate_edge_streak(
+    activity_page,
+    fallback_page=None,
+    timeout_ms: int = 5000,
+    activation_timeout_ms: int = EDGE_STREAK_ACTIVATION_TIMEOUT_MS,
+) -> EdgeStreakActivation:
+    """点击一次激活链接；只有确认本次新增 Bing 页才算激活成功。"""
+    try:
+        existing_pages = set(activity_page.context.pages)
+    except Exception:
+        return EdgeStreakActivation(None, (), False)
+
+    candidates = [activity_page]
+    if fallback_page is not None and fallback_page is not activity_page:
+        candidates.append(fallback_page)
+    deadline = time.monotonic() + max(activation_timeout_ms, 0) / 1000
+    activation_link = None
+    while activation_link is None:
+        for candidate in candidates:
+            try:
+                link = candidate.locator(
+                    f"a:has-text('{EDGE_STREAK_ACTIVATION_TEXT}'):visible"
+                ).first
+                if link.count() > 0 and link.is_visible():
+                    activation_link = link
+                    break
+            except Exception:
+                continue
+        if activation_link is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return EdgeStreakActivation(None, (), False)
+            delay_ms = max(
+                1,
+                min(EDGE_STREAK_ACTIVATION_POLL_MS, math.ceil(remaining * 1000)),
+            )
+            try:
+                activity_page.wait_for_timeout(delay_ms)
+            except Exception:
+                time.sleep(delay_ms / 1000)
+
+    # 点击异常不代表没有打开新页：仍等待一个窗口，最后统一采集本次新增页。
+    try:
+        activation_link.click()
+    except Exception:
+        pass
+    try:
+        activation_page = _wait_for_activation_page(
+            activity_page, existing_pages, timeout_ms
+        )
+    finally:
+        created = tuple(_new_pages(activity_page, existing_pages))
+    if activation_page is None:
+        return EdgeStreakActivation(None, created, False)
+    return EdgeStreakActivation(activation_page, created, True)
+
+
+def _prepare_edge_streak(page) -> EdgeStreakEntry:
+    """打开 Edge 活动并返回入口页与本次新建页，供浏览与清理共用。"""
+    try:
+        current_url = page.url or ""
+    except Exception:
+        return EdgeStreakEntry(None, (), False)
+    if _is_edge_streak_url(current_url):
+        return EdgeStreakEntry(page, (), False)
 
     # 新版卡片是 button，点击后才展开带“使用 Edge”的 dialog。
     try:
         card = page.locator('button:has-text("Microsoft Edge"):has-text("分钟")').first
         if card.count() > 0 and card.is_visible():
             card.click()
-            page.wait_for_timeout(1500)
+            try:
+                card.wait_for(state="hidden", timeout=5000)
+            except Exception:
+                page.wait_for_timeout(500)
     except Exception:
         pass
 
     try:
         link = page.locator("[role='dialog'] a:has-text('使用 Edge')").first
         if link.count() > 0 and link.is_visible():
-            # Microsoft 的活动链接有时新开标签，有时当前页跳转；只在确实弹出时取新页。
-            action_ctx = page.context
-            existing = set(action_ctx.pages)
-            link.click()
-            page.wait_for_timeout(3000)
-            opened = [pg for pg in action_ctx.pages if pg not in existing]
-            target = opened[-1] if opened else page
-            if target is not page:
-                target.wait_for_load_state("domcontentloaded", timeout=30000)
-                target.wait_for_timeout(1500)
-            return "edge-browsing-streak" in (target.url or "").lower()
+            # 无法稳定记录点击前快照时不能点击，避免历史活动页被误判为本次成功。
+            try:
+                existing_pages = set(page.context.pages)
+            except Exception:
+                existing_pages = None
+            if existing_pages is not None:
+                link.click()
+                target = _wait_for_edge_streak_target(
+                    page,
+                    [page],
+                    EDGE_STREAK_REDIRECT_TIMEOUT_MS,
+                    existing_pages=existing_pages,
+                )
+                created = tuple(_new_pages(page, existing_pages))
+                if target is not None:
+                    return EdgeStreakEntry(target, created, bool(created))
+                # 点击确实可能新建页面；即使慢跳转失败，也必须交给调用方清理。
+                return EdgeStreakEntry(None, created, bool(created))
     except Exception:
         pass
-    return "edge-browsing-streak" in (getattr(page, "url", "") or "").lower()
+
+    try:
+        if _is_edge_streak_url(page.url or ""):
+            return EdgeStreakEntry(page, (), False)
+        safe_goto(page, EDGE_STREAK_LAUNCH_URL, timeout=30000, wait_extra=0)
+        target = _wait_for_edge_streak_target(
+            page,
+            [page],
+            EDGE_STREAK_REDIRECT_TIMEOUT_MS,
+            include_new_pages=False,
+        )
+        if target is not None:
+            return EdgeStreakEntry(target, (), False)
+    except Exception:
+        pass
+    return EdgeStreakEntry(None, (), False)
+
+
+def _close_edge_streak_pages(page, pages, protected_pages=None) -> None:
+    """逐个关闭本次新建页；传入页和受保护历史页永不关闭。"""
+    protected = set(protected_pages or ())
+    protected.add(page)
+    for target in pages or ():
+        if target is None or target in protected or target is page:
+            continue
+        try:
+            if not _page_is_closed(target):
+                target.close()
+        except Exception:
+            continue
+
+
+def _open_edge_streak(page) -> bool:
+    """兼容入口：仅表示已确认进入官方活动页。"""
+    return _prepare_edge_streak(page).activity_page is not None
 
 
 def _open_mobile_app(page) -> bool:
@@ -823,51 +1153,88 @@ def do_edge_browsing_streak(page, minutes: int = 30, poll_seconds: int = 60) -> 
     if not current:
         print("  未读取到 Edge 浏览进度")
         return 0
+    if not edge_browser_profile_logged_in():
+        print("  Edge 浏览器 profile 未登录，无法完成 Edge 浏览打卡。")
+        print("  网页 Rewards 登录不等于 Edge 浏览器登录；请先手动打开 Edge，")
+        print("  进入 设置 → 个人资料 → 登录目标 Microsoft 账号，并保持同步后重新运行。")
+        return 0
 
     try:
-        if not _open_edge_streak(page):
-            print("  未找到 Edge 浏览入口")
+        poll_seconds = max(1, int(poll_seconds))
+    except (TypeError, ValueError):
+        print("  Edge 浏览轮询周期无效，停止")
+        return 0
+    owned_pages = ()
+    owned_ids = set()
+    try:
+        entry = _prepare_edge_streak(page)
+        if entry.can_cleanup:
+            owned_pages = tuple(entry.created_pages)
+            owned_ids = {id(item) for item in owned_pages}
+        if entry.activity_page is None:
+            if entry.can_cleanup:
+                print("  页面已打开但未确认进入 Edge 活动，停止并清理")
+            else:
+                print("  未找到 Edge 浏览入口")
             return 0
+
+        activation = _activate_edge_streak(
+            entry.activity_page,
+            page,
+            activation_timeout_ms=EDGE_STREAK_ACTIVATION_TIMEOUT_MS,
+        )
+        if activation.created_pages:
+            for owned in activation.created_pages:
+                if id(owned) not in owned_ids:
+                    owned_pages = (*owned_pages, owned)
+                    owned_ids.add(id(owned))
+        if not activation.activated or activation.browsing_page is None:
+            print("  未打开本次新增的 Bing 激活页，停止 Edge 浏览")
+            return 0
+        browsing_page = activation.browsing_page
+        print("  已在新标签页激活 Edge 浏览")
+
         target = max(1, min(int(minutes), current[1]))
+        latest = current
         elapsed = 0
-        stable = 0
-        previous = current[0]
+        report_interval_seconds = min(300, target * 60)
         content_urls = (
             "https://www.bing.com/search?q=%E4%BB%8A%E6%97%A5%E6%96%B0%E9%97%BB&form=QBRE",
             "https://www.bing.com/search?q=%E7%A7%91%E6%8A%80%E8%B5%84%E8%AE%AF&form=QBRE",
             "https://www.bing.com/search?q=%E7%94%9F%E6%B4%BB%E8%B4%A2%E7%BB%8F&form=QBRE",
         )
         while elapsed < target * 60:
-            # 先保持 Edge 在真实内容页上操作，而不是空等。
+            if _page_is_closed(browsing_page):
+                print("  Edge 激活页已关闭，停止")
+                return 0
+            # 始终复用首次激活页；进度只回读原 dashboard，不重开活动页。
             content_url = content_urls[(elapsed // 300) % len(content_urls)]
-            safe_goto(page, content_url, wait_extra=1500)
+            safe_goto(browsing_page, content_url, wait_extra=1500)
             for _ in range(10):
-                page.mouse.wheel(0, random.randint(350, 850))
-                page.wait_for_timeout(random.randint(800, 1500))
-            page.wait_for_timeout(max(1000, poll_seconds * 1000 - 12000))
+                browsing_page.mouse.wheel(0, random.randint(350, 850))
+                browsing_page.wait_for_timeout(random.randint(800, 1500))
+            browsing_page.wait_for_timeout(max(1000, poll_seconds * 1000 - 12000))
             elapsed += poll_seconds
-            if elapsed % 300 < poll_seconds:
+            if elapsed % report_interval_seconds == 0 or elapsed >= target * 60:
                 safe_goto(page, REWARDS_DASHBOARD, wait_extra=2000)
                 now = read_streak_progress(page, "edge")
                 if now:
+                    latest = now
                     done, total = now
-                    print(f"    Edge 浏览: {done}/{total}（已等待 {elapsed // 60} 分钟）")
+                    print(f"    Edge 浏览: {done}/{total}（已等待 {min(elapsed, target * 60) // 60} 分钟）")
                     if done >= total:
                         return 1
-                    if done <= previous:
-                        stable += 1
-                        if stable >= 2:
-                            print("    Edge 浏览分钟未上报，停止等待")
-                            return 0
-                    else:
-                        stable = 0
-                        previous = done
-                if not _open_edge_streak(page):
-                    print("  Edge 浏览入口消失，停止")
-                    return 0
+        print(
+            f"  Edge 浏览器已登录，但已等待 {target} 分钟 Rewards 仍为 "
+            f"{latest[0]}/{latest[1]}，未回写打卡进度，停止且不伪造成功。"
+        )
     except Exception as exc:
-        print(f"  Edge 浏览异常: {str(exc).splitlines()[0][:100]}")
+        detail = str(exc).splitlines()
+        print(f"  Edge 浏览异常: {(detail[0] if detail else type(exc).__name__)[:100]}")
+    finally:
+        _close_edge_streak_pages(page, owned_pages)
     return 0
+
 
 def do_mobile_app_checkin(page) -> int:
     """打开 Bing 手机 App 签到入口；桌面无等价签到时不伪造成功。"""

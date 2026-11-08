@@ -17,9 +17,13 @@
   $env:BING_REWARDS_EDGE_USER_DATA_DIR="$env:LOCALAPPDATA\Microsoft\Edge\User Data"
   ```
   脚本会正常启动可见 Edge，再通过仅绑定 `127.0.0.1` 的临时 CDP 端口接入；不会用自动化实例抢占正式 profile。可用环境变量覆盖 profile 路径。
-- Bing 手机应用签到通过已连接 Android 模拟器中的 Bing App 完成（`com.microsoft.bing`）；默认自动检测。只有 App 内回读到 `checked` 才算成功，未连接设备或未确认时会明确记录，不伪造签到。
+- Bing 手机应用签到通过已连接 Android 模拟器中的 Bing App 完成（`com.microsoft.bing`）；默认自动检测。无模拟器或客户端禁用时 App 签到明确跳过，不影响其他已完成任务；有设备但身份不一致或未回读到 `checked` 时仍不伪造签到，单账号会明确报告未确认。
 - Rewards 桌面 WebView 的“桌面奖励应用每周专属任务”会自动继续；每次运行最多推进一个任务，并回读 `N/8` 进度确认增长。当前没有已启用任务时正常跳过。
+- WebView 的返回状态有明确区分：进度增长或无启用任务都不会导致账号失败；`WebView UIA 不可用，跳过（不影响其他任务）` 表示当前 Codex/Python 子进程或计划任务环境无法读取桌面 UIA，仅跳过 WebView，不会覆盖 Edge、搜索等已完成任务的账号成功；`Rewards 桌面 WebView 任务执行失败` 才表示实际任务定位或点击失败，账号仍报告失败。
 - 正式 Edge 与 WebView UIA 需要正常桌面权限。请用 `start.bat` 或计划任务运行，不要从受限/低完整性终端直接启动。
+- **Edge 打卡前置条件**：网页 Rewards 已登录**不等于** Edge 浏览器 profile 已登录。请先手动打开 Edge，进入 `设置 → 个人资料`，登录目标 Microsoft 账号并保持同步，再运行脚本。脚本只读检查 `Local State` 与 `Default/Preferences`，不会启动或修改 profile；未检测到登录账号时会快速停止，不空跑 30 分钟。
+  - 日志出现 `Edge 浏览器 profile 未登录`：按上述步骤登录 Edge。
+  - 日志出现 `Edge 浏览器已登录，但已等待 30 分钟 Rewards 仍为 ...，未回写打卡进度`：说明浏览器侧已有登录态，但 Rewards 尚未回写，脚本不会伪造成功。
 
 ## 使用步骤
 1. 安装依赖（Python 3.10+）：`python -m pip install playwright requests tenacity tqdm`
@@ -93,6 +97,7 @@ SMTP_TO=you@qq.com        # 多个用逗号分隔
 - `.env` 已在 `.gitignore` 中，凭据不会被提交。
 
 ## 其他说明
+- 当前机制的整体重构设计见 [docs/bingpoints-mechanism-refactor-design.md](docs/bingpoints-mechanism-refactor-design.md)；该文档为待评审方案，不代表现有代码已实施。
 - 热词接口结果会做缓存：成功结果按天复用；若接口失败会在一段时间内降频重试，避免频繁请求。
 - 若热词接口不可用，会使用内置默认关键词列表。
 - 移动端搜索仅在 `BING_REWARDS_MOBILE_SEARCHES > 0` 时执行。
