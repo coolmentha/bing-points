@@ -7,6 +7,7 @@ import random
 import re
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -38,6 +39,30 @@ class EdgeStreakActivation:
     browsing_page: object | None
     created_pages: tuple
     activated: bool
+
+
+class EdgeStreakStatus(str, Enum):
+    """Edge 浏览任务的明确结果；身份未知不能与进度已完成混用。"""
+
+    COMPLETED = "completed"
+    INCOMPLETE = "incomplete"
+    IDENTITY_MISMATCH = "identity_mismatch"
+    IDENTITY_UNVERIFIED = "identity_unverified"
+    ENTRY_FAILED = "entry_failed"
+    ACTIVATION_FAILED = "activation_failed"
+    INVALID_PROGRESS = "invalid_progress"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class EdgeStreakResult:
+    status: EdgeStreakStatus
+    progress: tuple[int, int] | None = None
+    identity: str | None = None
+
+    @property
+    def success(self) -> bool:
+        return self.status is EdgeStreakStatus.COMPLETED
 
 
 MICROSOFT_HOSTS = (
@@ -834,34 +859,132 @@ def _edge_profile_directories(profile_dir: Path) -> list[Path]:
     return directories
 
 
-def edge_browser_profile_logged_in(profile_dir=None) -> bool:
-    """只读判断 Edge 浏览器 profile 是否有登录账号证据。
+def _normalize_email(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
 
-    网页 Rewards 已登录不代表 Edge 浏览器 profile 已登录。只有 Local State
-    的 user_name 或 profile 的 Preferences.account_info 出现非空账号信息时
-    才返回 True；文件缺失、锁定、JSON 损坏等一律按安全未知处理为 False。
+
+def _selected_edge_profile(profile_dir=None) -> tuple[Path, Path | None, dict | None]:
+    """返回 (User Data 根目录, 当前 profile 目录, Local State)。
+
+    多 profile 且没有 last_used 时 profile 目录为 None，调用方必须安全失败，
+    不能遍历所有 profile 猜测当前账号。
     """
-    root = Path(profile_dir) if profile_dir is not None else Path(EDGE_USER_DATA_DIR)
-    profile_dirs = _edge_profile_directories(root)
-    if not profile_dirs and re.match(r"^(default|profile \d+)$", root.name, re.I):
-        profile_dirs = [root]
+    requested = Path(profile_dir) if profile_dir is not None else Path(EDGE_USER_DATA_DIR)
+    root = requested
+    if re.match(r"^(default|profile \d+)$", requested.name, re.I):
+        root = requested.parent
+        local_state_path = root / "Local State"
+        if not local_state_path.is_file():
+            local_state_path = requested / "Local State"
+        local_state = _load_json_object(local_state_path)
+        return root, requested, local_state
 
     local_state_path = root / "Local State"
-    if not local_state_path.is_file() and root.name.lower() != "user data":
-        local_state_path = root.parent / "Local State"
     local_state = _load_json_object(local_state_path)
-    if local_state:
-        info_cache = local_state.get("profile", {}).get("info_cache", {})
-        if isinstance(info_cache, dict):
-            for entry in info_cache.values():
-                if isinstance(entry, dict) and _has_account_value(entry.get("user_name")):
-                    return True
+    profile_dirs = {
+        directory.name.lower(): directory
+        for directory in _edge_profile_directories(root)
+    }
+    if not profile_dirs:
+        return root, None, local_state
 
-    for directory in profile_dirs:
-        preferences = _load_json_object(directory / "Preferences")
-        if preferences and _has_account_value(preferences.get("account_info")):
-            return True
-    return False
+    last_used = None
+    if local_state:
+        profile_state = local_state.get("profile", {})
+        if isinstance(profile_state, dict):
+            value = profile_state.get("last_used")
+            if isinstance(value, str):
+                last_used = value.strip()
+    if last_used:
+        selected = profile_dirs.get(last_used.lower())
+        return root, selected, local_state
+
+    info_cache = {}
+    if local_state and isinstance(local_state.get("profile"), dict):
+        cached = local_state["profile"].get("info_cache", {})
+        if isinstance(cached, dict):
+            info_cache = cached
+    if len(info_cache) == 1:
+        name = next(iter(info_cache))
+        selected = profile_dirs.get(str(name).lower())
+        if selected is not None:
+            return root, selected, local_state
+
+    if len(profile_dirs) == 1:
+        return root, next(iter(profile_dirs.values())), local_state
+    return root, None, local_state
+
+
+def _preferences_account_emails(preferences: dict | None) -> list[str]:
+    if not preferences:
+        return []
+    account_info = preferences.get("account_info")
+    if not isinstance(account_info, list):
+        return []
+    emails = []
+    for entry in account_info:
+        if not isinstance(entry, dict):
+            continue
+        email = _normalize_email(entry.get("email"))
+        if email and email not in emails:
+            emails.append(email)
+    return emails
+
+
+def edge_profile_identity(profile_dir=None) -> str | None:
+    """只读返回当前 Edge profile 的登录邮箱，无法唯一确定时返回 None。"""
+    _root, selected, local_state = _selected_edge_profile(profile_dir)
+    if selected is None:
+        return None
+
+    if local_state:
+        profile_state = local_state.get("profile", {})
+        info_cache = (
+            profile_state.get("info_cache", {})
+            if isinstance(profile_state, dict)
+            else {}
+        )
+        if isinstance(info_cache, dict):
+            cached = info_cache.get(selected.name)
+            if not isinstance(cached, dict):
+                for name, value in info_cache.items():
+                    if str(name).lower() == selected.name.lower():
+                        cached = value
+                        break
+            if isinstance(cached, dict):
+                user_name = _normalize_email(cached.get("user_name"))
+                if user_name:
+                    return user_name
+
+    preferences = _load_json_object(selected / "Preferences")
+    emails = _preferences_account_emails(preferences)
+    return emails[0] if len(emails) == 1 else None
+
+
+def edge_browser_profile_matches(profile_dir, expected_email) -> bool:
+    """目标邮箱必须与当前 profile 身份规范化后精确一致，未知一律不匹配。"""
+    expected = _normalize_email(expected_email)
+    if expected is None:
+        return False
+    actual = edge_profile_identity(profile_dir)
+    return actual is not None and actual == expected
+
+
+def edge_browser_profile_logged_in(profile_dir=None) -> bool:
+    """只读判断当前 Edge profile 是否有登录证据，不遍历猜测其他 profile。"""
+    if edge_profile_identity(profile_dir) is not None:
+        return True
+
+    # 兼容旧版 profile：Preferences 可能只有 account_name，没有 email。
+    # 仅当当前 profile 已唯一确定时才接受该证据。
+    _root, selected, _local_state = _selected_edge_profile(profile_dir)
+    if selected is None:
+        return False
+    preferences = _load_json_object(selected / "Preferences")
+    return bool(preferences and _has_account_value(preferences.get("account_info")))
 
 
 def _is_edge_streak_url(url: str) -> bool:
@@ -908,11 +1031,16 @@ def _wait_for_edge_streak_target(
     timeout_ms: int,
     existing_pages=None,
     include_new_pages: bool = True,
+    additional_targets=None,
 ) -> object | None:
-    """等待当前页或本次新页跳转到活动页；坏页不能中断其他页面轮询。"""
+    """等待当前页或事件确认的新页跳转到活动页；坏页不能中断轮询。"""
     deadline = time.monotonic() + max(timeout_ms, 0) / 1000
     known_targets = list(targets)
+    event_targets = additional_targets if additional_targets is not None else ()
     while True:
+        for target in list(event_targets):
+            if target not in known_targets:
+                known_targets.append(target)
         for target in known_targets:
             if _page_is_closed(target):
                 continue
@@ -950,31 +1078,63 @@ def _is_edge_activation_url(url: str) -> bool:
         return False
 
 
-def _new_pages(page, existing_pages) -> list:
-    """只返回点击后新增页面；快照不可用时返回空，不扫描历史页。"""
+def _expect_page_from_click(page, click) -> object | None:
+    """执行点击并只返回与这次点击绑定的 popup/expect_page 页面。
+
+    优先使用 page.expect_popup()，它只绑定当前页面产生的弹窗；并发用户
+    新开标签页不会进入所有权。旧客户端不支持时才回退 context.expect_page。
+    """
+    expect_popup = getattr(page, "expect_popup", None)
+    expect_page = getattr(page.context, "expect_page", None)
+    if callable(expect_popup):
+        expectation_factory = expect_popup
+    elif callable(expect_page):
+        expectation_factory = expect_page
+    else:
+        # 无事件上下文能力的旧客户端仍可点击，但不会因此获得页面所有权。
+        try:
+            click()
+        except Exception:
+            pass
+        return None
     try:
-        pages = list(page.context.pages)
+        expectation = expectation_factory(timeout=10000)
     except Exception:
-        return []
-    return [
-        item for item in pages
-        if item is not page and item not in existing_pages
-    ]
+        return None
+
+    try:
+        with expectation as info:
+            try:
+                click()
+            except Exception:
+                pass
+    except Exception:
+        # 点击或等待超时都不影响已发生的 expect_page 结果读取。
+        pass
+
+    try:
+        if isinstance(info, dict):
+            captured = info.get("page")
+        else:
+            captured = getattr(info, "value", info)
+            if hasattr(captured, "value"):
+                captured = captured.value
+    except Exception:
+        return None
+    if captured is page or captured is None:
+        return None
+    return captured
 
 
 def _wait_for_activation_page(
     anchor_page,
-    existing_pages,
+    owned_pages,
     timeout_ms: int,
 ) -> object | None:
-    """等待本次点击新增的 Bing 激活页；历史标签页永远不参与。"""
+    """等待事件确认的 Bing 激活页；历史标签页永远不参与。"""
     deadline = time.monotonic() + max(timeout_ms, 0) / 1000
-    known_pages = []
     while True:
-        for target in _new_pages(anchor_page, existing_pages):
-            if target not in known_pages:
-                known_pages.append(target)
-        for target in known_pages:
+        for target in owned_pages:
             if _page_is_closed(target):
                 continue
             try:
@@ -998,12 +1158,7 @@ def _activate_edge_streak(
     timeout_ms: int = 5000,
     activation_timeout_ms: int = EDGE_STREAK_ACTIVATION_TIMEOUT_MS,
 ) -> EdgeStreakActivation:
-    """点击一次激活链接；只有确认本次新增 Bing 页才算激活成功。"""
-    try:
-        existing_pages = set(activity_page.context.pages)
-    except Exception:
-        return EdgeStreakActivation(None, (), False)
-
+    """点击一次激活链接；只有事件确认的本次新增 Bing 页才算激活成功。"""
     candidates = [activity_page]
     if fallback_page is not None and fallback_page is not activity_page:
         candidates.append(fallback_page)
@@ -1033,24 +1188,21 @@ def _activate_edge_streak(
             except Exception:
                 time.sleep(delay_ms / 1000)
 
-    # 点击异常不代表没有打开新页：仍等待一个窗口，最后统一采集本次新增页。
-    try:
-        activation_link.click()
-    except Exception:
-        pass
-    try:
-        activation_page = _wait_for_activation_page(
-            activity_page, existing_pages, timeout_ms
-        )
-    finally:
-        created = tuple(_new_pages(activity_page, existing_pages))
+    # 点击异常也可能发生在新页打开之后；只接受 expect_page 返回的专属页。
+    captured = _expect_page_from_click(activity_page, activation_link.click)
+    if captured is None:
+        return EdgeStreakActivation(None, (), False)
+    created = (captured,)
+    activation_page = _wait_for_activation_page(
+        activity_page, created, timeout_ms
+    )
     if activation_page is None:
         return EdgeStreakActivation(None, created, False)
     return EdgeStreakActivation(activation_page, created, True)
 
 
 def _prepare_edge_streak(page) -> EdgeStreakEntry:
-    """打开 Edge 活动并返回入口页与本次新建页，供浏览与清理共用。"""
+    """打开 Edge 活动并返回入口页与事件确认的本次新建页。"""
     try:
         current_url = page.url or ""
     except Exception:
@@ -1073,23 +1225,23 @@ def _prepare_edge_streak(page) -> EdgeStreakEntry:
     try:
         link = page.locator("[role='dialog'] a:has-text('使用 Edge')").first
         if link.count() > 0 and link.is_visible():
-            # 无法稳定记录点击前快照时不能点击，避免历史活动页被误判为本次成功。
             try:
-                existing_pages = set(page.context.pages)
+                list(page.context.pages)
             except Exception:
-                existing_pages = None
-            if existing_pages is not None:
-                link.click()
-                target = _wait_for_edge_streak_target(
-                    page,
-                    [page],
-                    EDGE_STREAK_REDIRECT_TIMEOUT_MS,
-                    existing_pages=existing_pages,
-                )
-                created = tuple(_new_pages(page, existing_pages))
+                link = None
+            if link is not None:
+                captured = _expect_page_from_click(page, link.click)
+                created = (captured,) if captured is not None else ()
+                target = None
+                if captured is not None:
+                    target = _wait_for_edge_streak_target(
+                        page,
+                        [captured],
+                        EDGE_STREAK_REDIRECT_TIMEOUT_MS,
+                        include_new_pages=False,
+                    )
                 if target is not None:
                     return EdgeStreakEntry(target, created, bool(created))
-                # 点击确实可能新建页面；即使慢跳转失败，也必须交给调用方清理。
                 return EdgeStreakEntry(None, created, bool(created))
     except Exception:
         pass
@@ -1143,29 +1295,73 @@ def _open_mobile_app(page) -> bool:
     return False
 
 
-def do_edge_browsing_streak(page, minutes: int = 30, poll_seconds: int = 60) -> int:
-    """用 Edge 持续真实浏览；仅页面回执到 30/30 时返回 1。"""
+def valid_edge_progress(progress) -> tuple[int, int] | None:
+    """返回合法 Edge 进度；完成判定必须同时满足 total>0 和 0<=done<=total。"""
+    try:
+        done, total = progress
+        done = int(done)
+        total = int(total)
+    except (TypeError, ValueError):
+        return None
+    if total <= 0 or done < 0 or done > total:
+        return None
+    return done, total
+
+
+# 兼容已有内部调用/测试；新代码应使用公开的 valid_edge_progress。
+_valid_edge_progress = valid_edge_progress
+
+
+def do_edge_browsing_streak_detail(
+    page,
+    minutes: int = 30,
+    poll_seconds: int = 60,
+    expected_email: str | None = None,
+) -> EdgeStreakResult:
+    """执行 Edge 浏览并返回不可被页面进度覆盖的明确状态。"""
     print("  检查 Edge 浏览连续打卡...")
-    current = read_streak_progress(page, "edge")
-    if current and current[0] >= current[1]:
-        print(f"  Edge 浏览已完成: {current[0]}/{current[1]}")
-        return 1
-    if not current:
-        print("  未读取到 Edge 浏览进度")
-        return 0
-    if not edge_browser_profile_logged_in():
+    if expected_email is not None:
+        actual = edge_profile_identity(EDGE_USER_DATA_DIR)
+        expected = _normalize_email(expected_email)
+        if actual is None:
+            print("  Edge 浏览器 profile 无法确认目标账号，停止且不打开活动。")
+            return EdgeStreakResult(EdgeStreakStatus.IDENTITY_UNVERIFIED)
+        if expected is None or actual != expected:
+            print("  Edge 浏览器 profile 目标账号不匹配，停止且不打开活动。")
+            print("  请确认 Edge 当前实际使用的 profile 已登录网页账号的目标 Microsoft 账号。")
+            return EdgeStreakResult(
+                EdgeStreakStatus.IDENTITY_MISMATCH, identity=actual
+            )
+        identity = actual
+    elif not edge_browser_profile_logged_in():
         print("  Edge 浏览器 profile 未登录，无法完成 Edge 浏览打卡。")
         print("  网页 Rewards 登录不等于 Edge 浏览器登录；请先手动打开 Edge，")
         print("  进入 设置 → 个人资料 → 登录目标 Microsoft 账号，并保持同步后重新运行。")
-        return 0
+        return EdgeStreakResult(EdgeStreakStatus.IDENTITY_UNVERIFIED)
+    else:
+        identity = edge_profile_identity(EDGE_USER_DATA_DIR)
+        print("  Edge 浏览器 profile 已登录；未校验目标账号（调用方未提供 expected_email）。")
+
+    current = _valid_edge_progress(read_streak_progress(page, "edge"))
+    if current is None:
+        print("  未读取到有效的 Edge 浏览进度，停止且不伪造成功")
+        return EdgeStreakResult(EdgeStreakStatus.INVALID_PROGRESS)
+    if current[0] >= current[1]:
+        print(f"  Edge 浏览已完成: {current[0]}/{current[1]}")
+        return EdgeStreakResult(
+            EdgeStreakStatus.COMPLETED, progress=current, identity=identity
+        )
 
     try:
         poll_seconds = max(1, int(poll_seconds))
     except (TypeError, ValueError):
         print("  Edge 浏览轮询周期无效，停止")
-        return 0
+        return EdgeStreakResult(
+            EdgeStreakStatus.INCOMPLETE, progress=current, identity=identity
+        )
     owned_pages = ()
     owned_ids = set()
+    latest = current
     try:
         entry = _prepare_edge_streak(page)
         if entry.can_cleanup:
@@ -1176,7 +1372,9 @@ def do_edge_browsing_streak(page, minutes: int = 30, poll_seconds: int = 60) -> 
                 print("  页面已打开但未确认进入 Edge 活动，停止并清理")
             else:
                 print("  未找到 Edge 浏览入口")
-            return 0
+            return EdgeStreakResult(
+                EdgeStreakStatus.ENTRY_FAILED, progress=latest, identity=identity
+            )
 
         activation = _activate_edge_streak(
             entry.activity_page,
@@ -1190,12 +1388,15 @@ def do_edge_browsing_streak(page, minutes: int = 30, poll_seconds: int = 60) -> 
                     owned_ids.add(id(owned))
         if not activation.activated or activation.browsing_page is None:
             print("  未打开本次新增的 Bing 激活页，停止 Edge 浏览")
-            return 0
+            return EdgeStreakResult(
+                EdgeStreakStatus.ACTIVATION_FAILED,
+                progress=latest,
+                identity=identity,
+            )
         browsing_page = activation.browsing_page
         print("  已在新标签页激活 Edge 浏览")
 
         target = max(1, min(int(minutes), current[1]))
-        latest = current
         elapsed = 0
         report_interval_seconds = min(300, target * 60)
         content_urls = (
@@ -1206,7 +1407,9 @@ def do_edge_browsing_streak(page, minutes: int = 30, poll_seconds: int = 60) -> 
         while elapsed < target * 60:
             if _page_is_closed(browsing_page):
                 print("  Edge 激活页已关闭，停止")
-                return 0
+                return EdgeStreakResult(
+                    EdgeStreakStatus.INCOMPLETE, progress=latest, identity=identity
+                )
             # 始终复用首次激活页；进度只回读原 dashboard，不重开活动页。
             content_url = content_urls[(elapsed // 300) % len(content_urls)]
             safe_goto(browsing_page, content_url, wait_extra=1500)
@@ -1217,13 +1420,17 @@ def do_edge_browsing_streak(page, minutes: int = 30, poll_seconds: int = 60) -> 
             elapsed += poll_seconds
             if elapsed % report_interval_seconds == 0 or elapsed >= target * 60:
                 safe_goto(page, REWARDS_DASHBOARD, wait_extra=2000)
-                now = read_streak_progress(page, "edge")
+                now = _valid_edge_progress(read_streak_progress(page, "edge"))
                 if now:
                     latest = now
                     done, total = now
                     print(f"    Edge 浏览: {done}/{total}（已等待 {min(elapsed, target * 60) // 60} 分钟）")
                     if done >= total:
-                        return 1
+                        return EdgeStreakResult(
+                            EdgeStreakStatus.COMPLETED,
+                            progress=now,
+                            identity=identity,
+                        )
         print(
             f"  Edge 浏览器已登录，但已等待 {target} 分钟 Rewards 仍为 "
             f"{latest[0]}/{latest[1]}，未回写打卡进度，停止且不伪造成功。"
@@ -1231,9 +1438,30 @@ def do_edge_browsing_streak(page, minutes: int = 30, poll_seconds: int = 60) -> 
     except Exception as exc:
         detail = str(exc).splitlines()
         print(f"  Edge 浏览异常: {(detail[0] if detail else type(exc).__name__)[:100]}")
+        return EdgeStreakResult(
+            EdgeStreakStatus.ERROR, progress=latest, identity=identity
+        )
     finally:
         _close_edge_streak_pages(page, owned_pages)
-    return 0
+    return EdgeStreakResult(
+        EdgeStreakStatus.INCOMPLETE, progress=latest, identity=identity
+    )
+
+
+def do_edge_browsing_streak(
+    page,
+    minutes: int = 30,
+    poll_seconds: int = 60,
+    expected_email: str | None = None,
+) -> int:
+    """兼容入口：只有明确 COMPLETED 才返回 1。"""
+    result = do_edge_browsing_streak_detail(
+        page,
+        minutes=minutes,
+        poll_seconds=poll_seconds,
+        expected_email=expected_email,
+    )
+    return 1 if result.success else 0
 
 
 def do_mobile_app_checkin(page) -> int:

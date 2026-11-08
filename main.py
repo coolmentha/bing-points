@@ -21,6 +21,9 @@ from utils.accounts import load_accounts
 from utils.clients import (
     list_android_devices,
     mobile_checkin,
+    REWARDS_DESKTOP_IDENTITY_MISMATCH,
+    REWARDS_DESKTOP_IDENTITY_UNVERIFIED,
+    REWARDS_DESKTOP_TASK_ITEM_MISSING,
     REWARDS_DESKTOP_UIA_UNAVAILABLE,
     rewards_desktop_state,
     run_rewards_desktop_task,
@@ -50,7 +53,9 @@ from utils.tasks import (
     do_daily_offer_tasks,
     do_daily_set_tasks,
     do_dashboard_activities,
-    do_edge_browsing_streak,
+    do_edge_browsing_streak_detail,
+    EdgeStreakStatus,
+    valid_edge_progress,
     do_mobile_app_checkin,
     do_point_punch_cards,
     read_streak_progress,
@@ -528,12 +533,30 @@ def run_account(p, context, username: str, password: str, headless: bool, total_
         print("\n  --- Edge 浏览连续打卡 ---")
         safe_goto(page, REWARDS_DASHBOARD, wait_extra=3000)
         if EDGE_USER_DATA_DIR.resolve() != USER_DATA_DIR.resolve():
-            edge_ok = do_edge_browsing_streak(page)
-            if not edge_ok:
-                current_edge = read_streak_progress(page, "edge")
-                if not current_edge or current_edge[0] < current_edge[1]:
+            edge_result = do_edge_browsing_streak_detail(
+                page, expected_email=username
+            )
+            if edge_result.status is EdgeStreakStatus.IDENTITY_UNVERIFIED:
+                print("  Edge 浏览器 profile 无法确认目标账号，账号不报告成功")
+                return False
+            if edge_result.status is EdgeStreakStatus.IDENTITY_MISMATCH:
+                print("  Edge 浏览器 profile 账号与目标账号不一致，账号不报告成功")
+                return False
+            if edge_result.status is EdgeStreakStatus.INVALID_PROGRESS:
+                print("  Edge 浏览进度异常，账号不报告成功")
+                return False
+            if edge_result.status is EdgeStreakStatus.COMPLETED:
+                pass
+            elif edge_result.status is EdgeStreakStatus.INCOMPLETE:
+                current_edge = valid_edge_progress(
+                    read_streak_progress(page, "edge")
+                )
+                if current_edge is None or current_edge[0] < current_edge[1]:
                     print("  Edge 浏览任务未完成，账号不报告成功")
                     return False
+            else:
+                print(f"  Edge 浏览任务失败: {edge_result.status.value}")
+                return False
         else:
             print("  当前为隔离 profile，跳过 Edge 30 分钟任务（需正式 Edge profile）")
 
@@ -552,9 +575,18 @@ def run_account(p, context, username: str, password: str, headless: bool, total_
 
         # 12.5 无启用任务可正常跳过；UIA 环境不可用不覆盖其他任务成功。
         print("\n  --- Rewards 桌面 WebView ---")
-        webview_status = run_rewards_desktop_task()
+        webview_status = run_rewards_desktop_task(username)
         if webview_status == REWARDS_DESKTOP_UIA_UNAVAILABLE:
             print("  WebView UIA 不可用，跳过（不影响其他任务）")
+        elif webview_status == REWARDS_DESKTOP_IDENTITY_UNVERIFIED:
+            print("  WebView 无法确认桌面应用账号身份，账号不报告成功")
+            return False
+        elif webview_status == REWARDS_DESKTOP_IDENTITY_MISMATCH:
+            print("  WebView 桌面应用账号与目标账号不一致，账号不报告成功")
+            return False
+        elif webview_status == REWARDS_DESKTOP_TASK_ITEM_MISSING:
+            print("  WebView 已进入任务页但未找到可点击任务项，账号不报告成功")
+            return False
         elif webview_status < 0:
             print("  Rewards 桌面 WebView 任务执行失败，账号不报告成功")
             return False

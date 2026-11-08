@@ -1,10 +1,13 @@
 param(
   [string]$Mode = "state",
   [long]$Hwnd = 0,
+  [string]$RunId = "",
+  [string]$ExpectedEmail = "",
   [string]$ResultPath = "$env:TEMP\bing_points_rewards_desktop.txt"
 )
 $ErrorActionPreference = "Stop"
-$lines = @()
+if (-not $RunId) { $RunId = [guid]::NewGuid().ToString("N") }
+$lines = @("RUN_ID=$RunId")
 $uiaReady = $false
 $inv = [System.Globalization.CultureInfo]::InvariantCulture
 $script:winHwnd = 0
@@ -367,6 +370,35 @@ function Find-TaskCandidate($Document) {
   }
 }
 
+function Find-VisibleEmail($Root) {
+  if ($null -eq $Root) { return "" }
+  $emailPattern = "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+  $preferred = @()
+  $fallback = @()
+  try {
+    foreach ($e in (Get-All $Root)) {
+      $name = Get-SafeName $e
+      if (-not $name) { continue }
+      $match = [regex]::Match($name, $emailPattern)
+      if (-not $match.Success) { continue }
+      $metadata = $name.ToLowerInvariant()
+      try { $metadata += " " + ([string]$e.Current.AutomationId).ToLowerInvariant() } catch {}
+      try { $metadata += " " + ([string]$e.Current.ClassName).ToLowerInvariant() } catch {}
+      if ($metadata -match "account|profile|user|email|邮箱|账号|帐户") {
+        $preferred += $match.Value
+      } else {
+        $fallback += $match.Value
+      }
+    }
+  } catch {}
+  foreach ($candidates in @($preferred, $fallback)) {
+    $unique = @($candidates | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique)
+    if ($unique.Count -eq 1) { return $unique[0] }
+    if ($unique.Count -gt 1) { return "" }
+  }
+  return ""
+}
+
 function Find-TaskItem($Document) {
   foreach ($e in (Get-All $Document)) {
     $name = Get-SafeName $e
@@ -407,6 +439,29 @@ try {
   $uiaReady = $true
   Add-Line "UIA_READY=1"
   Add-Line "DOC=$(Get-SafeName $doc)"
+
+  $desktopIdentity = Find-VisibleEmail $win
+  Add-Line "DESKTOP_IDENTITY=$desktopIdentity"
+  if ($ExpectedEmail) {
+    if (-not $desktopIdentity) {
+      Add-Line "IDENTITY_STATE=identity_unverified"
+      Add-Line "SUCCESS=0"
+      return
+    }
+    $sameIdentity = [string]::Equals(
+      $desktopIdentity.Trim(),
+      $ExpectedEmail.Trim(),
+      [System.StringComparison]::OrdinalIgnoreCase
+    )
+    if (-not $sameIdentity) {
+      Add-Line "IDENTITY_STATE=identity_mismatch"
+      Add-Line "SUCCESS=0"
+      return
+    }
+    Add-Line "IDENTITY_STATE=verified"
+  } else {
+    Add-Line "IDENTITY_STATE=not_checked"
+  }
 
   $startDocumentName = ""
   $earnTab = Find-EarnTab
@@ -479,6 +534,8 @@ try {
   $taskItem = Find-TaskItem $taskDocument
   if ($null -eq $taskItem) {
     Add-Line "TASK=0"
+    Add-Line "TASK_STATE=task_item_missing"
+    Add-Line "TASK_ERROR=weekly_item_missing"
     Add-Line "SUCCESS=0"
     return
   }

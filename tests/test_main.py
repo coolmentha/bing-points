@@ -1,10 +1,12 @@
 import json
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from utils import accounts, browser, clients, config, dashboard, tasks, trends
+from utils.tasks import EdgeStreakResult, EdgeStreakStatus
 
 
 @pytest.fixture(autouse=True)
@@ -1124,6 +1126,368 @@ def test_edge_browser_profile_login_missing_or_corrupt_json_is_not_logged_in(tmp
     assert tasks.edge_browser_profile_logged_in(corrupt) is False
 
 
+def test_edge_profile_identity_uses_current_profile_and_matches_exact_email(tmp_path):
+    account_a = "account-a@example.invalid"
+    account_b = "account-b@example.invalid"
+    for name in ("Default", "Profile 1"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "Preferences").write_text("{}", encoding="utf-8")
+    (tmp_path / "Local State").write_text(
+        json.dumps({
+            "profile": {
+                "info_cache": {
+                    "Default": {"user_name": account_a},
+                    "Profile 1": {"user_name": account_b},
+                },
+                "last_used": "Profile 1",
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    assert tasks.edge_profile_identity(tmp_path) == account_b
+    assert tasks.edge_browser_profile_matches(tmp_path, f" {account_b.upper()} ") is True
+    assert tasks.edge_browser_profile_matches(tmp_path, account_a) is False
+
+
+def test_edge_profile_identity_does_not_guess_between_multiple_profiles(tmp_path):
+    for name in ("Default", "Profile 1"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "Preferences").write_text("{}", encoding="utf-8")
+    (tmp_path / "Local State").write_text(
+        json.dumps({
+            "profile": {
+                "info_cache": {
+                    "Default": {"user_name": "account-a@example.invalid"},
+                    "Profile 1": {"user_name": "account-b@example.invalid"},
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    assert tasks.edge_profile_identity(tmp_path) is None
+    assert tasks.edge_browser_profile_matches(
+        tmp_path, "account-a@example.invalid"
+    ) is False
+    assert tasks.edge_browser_profile_logged_in(tmp_path) is False
+
+
+def test_edge_profile_identity_reads_preferences_email_without_local_user_name(tmp_path):
+    profile = tmp_path / "Default"
+    profile.mkdir()
+    expected = "profile-email@example.invalid"
+    (profile / "Preferences").write_text(
+        json.dumps({"account_info": [{"email": expected}]}),
+        encoding="utf-8",
+    )
+    (tmp_path / "Local State").write_text(
+        json.dumps({"profile": {"info_cache": {"Default": {"user_name": ""}}}}),
+        encoding="utf-8",
+    )
+
+    assert tasks.edge_profile_identity(tmp_path) == expected
+    assert tasks.edge_browser_profile_matches(tmp_path, expected) is True
+
+
+def test_edge_profile_identity_corrupt_json_is_unknown(tmp_path):
+    profile = tmp_path / "Default"
+    profile.mkdir()
+    (profile / "Preferences").write_text("{broken", encoding="utf-8")
+    (tmp_path / "Local State").write_text("{broken", encoding="utf-8")
+
+    assert tasks.edge_profile_identity(tmp_path) is None
+    assert tasks.edge_browser_profile_matches(
+        tmp_path, "account@example.invalid"
+    ) is False
+
+
+def test_edge_streak_rejects_unexpected_profile_before_opening(monkeypatch, capsys):
+    page = type("Page", (), {"url": "https://rewards.bing.com/dashboard"})()
+    actions = []
+    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: (0, 30))
+    monkeypatch.setattr(tasks, "edge_browser_profile_matches", lambda *_args: False)
+    monkeypatch.setattr(
+        tasks,
+        "_prepare_edge_streak",
+        lambda *_args: actions.append("open") or tasks.EdgeStreakEntry(page, (), False),
+    )
+
+    assert tasks.do_edge_browsing_streak(
+        page, minutes=30, poll_seconds=60, expected_email="target@example.invalid"
+    ) == 0
+    assert actions == []
+    output = capsys.readouterr().out
+    assert "目标账号不匹配" in output
+
+
+def test_edge_streak_identity_mismatch_cannot_be_overridden_by_complete_progress(monkeypatch):
+    page = type("Page", (), {"url": "https://rewards.bing.com/dashboard"})()
+    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: (30, 30))
+    monkeypatch.setattr(
+        tasks, "edge_profile_identity", lambda *_args: "other@example.invalid"
+    )
+    opened = []
+    monkeypatch.setattr(
+        tasks,
+        "_prepare_edge_streak",
+        lambda *_args: opened.append(True) or tasks.EdgeStreakEntry(page, (), False),
+    )
+
+    result = tasks.do_edge_browsing_streak_detail(
+        page, expected_email="target@example.invalid"
+    )
+
+    assert result.status is tasks.EdgeStreakStatus.IDENTITY_MISMATCH
+    assert result.progress is None
+    assert result.success is False
+    assert opened == []
+    assert tasks.do_edge_browsing_streak(
+        page, expected_email="target@example.invalid"
+    ) == 0
+
+
+def test_edge_streak_identity_unverified_is_explicit(monkeypatch):
+    page = type("Page", (), {"url": "https://rewards.bing.com/dashboard"})()
+    monkeypatch.setattr(tasks, "edge_profile_identity", lambda *_args: None)
+
+    result = tasks.do_edge_browsing_streak_detail(
+        page, expected_email="target@example.invalid"
+    )
+
+    assert result.status is tasks.EdgeStreakStatus.IDENTITY_UNVERIFIED
+    assert result.success is False
+
+
+@pytest.mark.parametrize("progress", [(0, 0), (1, 0), (-1, 30), (31, 30)])
+def test_valid_edge_progress_rejects_invalid_ranges(progress):
+    assert tasks.valid_edge_progress(progress) is None
+
+
+@pytest.mark.parametrize("progress", [(0, 30), (29, 30), (30, 30)])
+def test_valid_edge_progress_accepts_inclusive_range(progress):
+    assert tasks.valid_edge_progress(progress) == progress
+
+
+@pytest.mark.parametrize("progress", [(0, 0), (1, 0), (-1, 30), (31, 30)])
+def test_edge_streak_rejects_invalid_progress(monkeypatch, progress):
+    page = type("Page", (), {"url": "https://rewards.bing.com/dashboard"})()
+    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: progress)
+    monkeypatch.setattr(tasks, "edge_browser_profile_logged_in", lambda *_args: True)
+
+    result = tasks.do_edge_browsing_streak_detail(page)
+
+    assert result.status is tasks.EdgeStreakStatus.INVALID_PROGRESS
+    assert result.success is False
+    assert tasks.do_edge_browsing_streak(page) == 0
+
+
+class _PageExpectation:
+    def __init__(self, context):
+        self.context = context
+
+    @property
+    def value(self):
+        return self.context.next_page
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None and self.context.next_page is None:
+            raise TimeoutError("expect_page timeout")
+        return False
+
+
+class _ExpectPageContext:
+    def __init__(self, pages=()):
+        self.pages = list(pages)
+        self.handlers = {}
+        self.next_page = None
+
+    def on(self, event, handler):
+        self.handlers.setdefault(event, []).append(handler)
+
+    def remove_listener(self, event, handler):
+        self.handlers[event].remove(handler)
+
+    def emit(self, event, page):
+        if page not in self.pages:
+            self.pages.append(page)
+        for handler in list(self.handlers.get(event, ())):
+            handler(page)
+
+    def expect_page(self, **_kwargs):
+        return _PageExpectation(self)
+
+
+def test_prepare_edge_streak_does_not_adopt_unowned_historical_activity_page(monkeypatch):
+    class EmptyLocator:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        def count(self):
+            return 0
+
+        def is_visible(self):
+            return False
+
+    class Context(_ExpectPageContext):
+        def __init__(self, pages):
+            super().__init__(pages)
+
+    class Link(EmptyLocator):
+        def __init__(self, page):
+            super().__init__()
+            self.page = page
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def click(self):
+            # 模拟点击没有产生 page 事件，但上下文里同时出现一个活动页。
+            self.page.context.pages.append(self.page.historical_activity)
+
+    class Page:
+        closed = False
+
+        def __init__(self, name, url, context):
+            self.name = name
+            self.url = url
+            self.context = context
+            self.historical_activity = None
+
+        def is_closed(self):
+            return self.closed
+
+        def locator(self, selector):
+            if "role='dialog'" in selector:
+                return Link(self)
+            return EmptyLocator()
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    historical = Page(
+        "historical",
+        "https://rewards.bing.com/promo/edge-browsing-streak?form=STALE",
+        None,
+    )
+    context = Context([historical])
+    page = Page("dashboard", "https://rewards.bing.com/dashboard", context)
+    historical.context = context
+    context.pages = [historical, page]
+    page.historical_activity = historical
+    monkeypatch.setattr(tasks, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 1)
+
+    entry = tasks._prepare_edge_streak(page)
+
+    assert entry.activity_page is None
+    assert entry.created_pages == ()
+    assert entry.can_cleanup is False
+
+
+def test_edge_streak_expect_page_owns_only_clicked_tabs(monkeypatch):
+    class EventContext(_ExpectPageContext):
+        def expect_page(self, **_kwargs):
+            raise AssertionError("有 expect_popup 时不得使用 context 级 expect_page")
+
+    class Locator:
+        def __init__(self, page, kind):
+            self.page = page
+            self.kind = kind
+            self.first = self
+
+        def count(self):
+            return 1
+
+        def is_visible(self):
+            return True
+
+        def wait_for(self, **_kwargs):
+            return None
+
+        def click(self):
+            if self.kind == "prepare":
+                # 用户并发打开的页面触发全局 page 事件，但不是 expect_page 的结果。
+                self.page.context.emit("page", self.page.user_tab)
+                self.page.context.next_page = self.page.activity
+                self.page.context.pages.append(self.page.activity)
+            elif self.kind == "activate":
+                self.page.context.emit("page", self.page.user_tab_2)
+                self.page.context.next_page = self.page.activation
+                self.page.context.pages.append(self.page.activation)
+
+    class Page:
+        def __init__(self, name, url, context=None):
+            self.name = name
+            self.url = url
+            self.closed = False
+            self.context = context
+            self.wheel_count = 0
+            self.mouse = type(
+                "Mouse", (), {"wheel": lambda _self, *_args: setattr(
+                    self, "wheel_count", self.wheel_count + 1
+                )}
+            )()
+
+        def is_closed(self):
+            return self.closed
+
+        def close(self):
+            self.closed = True
+
+        def locator(self, selector):
+            if "role='dialog'" in selector and "使用 Edge" in selector:
+                return Locator(self, "prepare")
+            if "开始在 Edge 上浏览" in selector:
+                return Locator(self, "activate")
+            return Locator(self, "empty")
+
+        def expect_popup(self, **_kwargs):
+            return _PageExpectation(self.context)
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    context = EventContext([])
+    dashboard = Page("dashboard", "https://rewards.bing.com/dashboard", context)
+    historical = Page("historical", "https://example.com/user-tab", context)
+    activity = Page(
+        "activity",
+        "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL",
+        context,
+    )
+    activation = Page(
+        "activation", "https://cn.bing.com/?rwgbopen=1&FORM=rwbsl1", context
+    )
+    user_tab = Page("user-tab", "https://example.com/new-user-tab", context)
+    user_tab_2 = Page("user-tab-2", "https://example.com/another-user-tab", context)
+    context.pages = [historical, dashboard]
+    dashboard.user_tab = user_tab
+    dashboard.activity = activity
+    activity.user_tab_2 = user_tab_2
+    activity.activation = activation
+
+    progress = iter([(0, 30), (30, 30)])
+    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: next(progress))
+    monkeypatch.setattr(tasks, "safe_goto", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(tasks, "edge_browser_profile_logged_in", lambda *_args: True)
+
+    assert tasks.do_edge_browsing_streak(dashboard, minutes=1, poll_seconds=60) == 1
+    assert activity.closed is True
+    assert activation.closed is True
+    assert dashboard.closed is False
+    assert historical.closed is False
+    assert user_tab.closed is False
+    assert user_tab_2.closed is False
+
+
 def test_open_edge_streak_waits_for_delayed_redirect():
     """新标签页可慢跳转；不关闭它以免打断活动上报，残余标签页风险已知。"""
     class Locator:
@@ -1149,11 +1513,11 @@ def test_open_edge_streak_waits_for_delayed_redirect():
                 self.page.dialog_open = True
             elif self.kind == "link":
                 self.page.link_clicked = True
-                self.page.context.pages.append(self.page.target)
+                self.page.context.next_page = self.page.target
 
-    class Context:
+    class Context(_ExpectPageContext):
         def __init__(self, page):
-            self.pages = [page]
+            super().__init__([page])
 
     class Target:
         def __init__(self, page):
@@ -1200,6 +1564,7 @@ def test_open_edge_streak_waits_for_delayed_redirect():
             self._advance(ms)
 
     page = Page()
+    page.context.next_page = page.target
 
     original_pages = list(page.context.pages)
     assert tasks._open_edge_streak(page) is True
@@ -1649,14 +2014,17 @@ def test_activate_edge_streak_collects_page_created_after_click_timeout(monkeypa
             return True
 
         def click(self):
-            return None
+            self.activity.context.next_page = self.activity.delayed
+
+    class Context(_ExpectPageContext):
+        pass
 
     class Page:
-        def __init__(self, name, url):
+        def __init__(self, name, url, context=None):
             self.name = name
             self.url = url
             self.closed = False
-            self.context = type("Context", (), {"pages": []})()
+            self.context = context or Context()
 
         def is_closed(self):
             return self.closed
@@ -1670,12 +2038,12 @@ def test_activate_edge_streak_collects_page_created_after_click_timeout(monkeypa
             return EmptyLocator()
 
         def wait_for_timeout(self, ms):
-            self.context.pages.append(self.delayed)
+            self.context.emit("page", self.delayed)
 
     activity = Page(
         "activity", "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
     )
-    delayed = Page("delayed", "about:blank")
+    delayed = Page("delayed", "about:blank", activity.context)
     delayed.wait_for_timeout = lambda _ms: None
     activity.delayed = delayed
     activity.context.pages = [activity]
@@ -1717,15 +2085,18 @@ def test_activate_edge_streak_collects_page_when_click_raises(monkeypatch):
             return True
 
         def click(self):
-            self.activity.context.pages.append(self.activity.delayed)
+            self.activity.context.next_page = self.activity.delayed
             raise RuntimeError("click interrupted after navigation")
 
+    class Context(_ExpectPageContext):
+        pass
+
     class Page:
-        def __init__(self, name, url):
+        def __init__(self, name, url, context=None):
             self.name = name
             self.url = url
             self.closed = False
-            self.context = type("Context", (), {"pages": []})()
+            self.context = context or Context()
 
         def is_closed(self):
             return self.closed
@@ -1744,7 +2115,7 @@ def test_activate_edge_streak_collects_page_when_click_raises(monkeypatch):
     activity = Page(
         "activity", "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
     )
-    delayed = Page("delayed", "about:blank")
+    delayed = Page("delayed", "about:blank", activity.context)
     activity.delayed = delayed
     activity.context.pages = [activity]
     monkeypatch.setattr(tasks, "EDGE_STREAK_ACTIVATION_POLL_MS", 1)
@@ -1786,17 +2157,19 @@ def test_edge_streak_unexpected_new_page_is_cleaned_by_finally(monkeypatch, clic
             return True
 
         def click(self):
+            self.activity.context.next_page = self.activity.delayed
             if click_raises:
-                self.activity.context.pages.append(self.activity.delayed)
                 raise RuntimeError("click interrupted")
-            return None
+
+    class Context(_ExpectPageContext):
+        pass
 
     class Page:
-        def __init__(self, name, url):
+        def __init__(self, name, url, context=None):
             self.name = name
             self.url = url
             self.closed = False
-            self.context = type("Context", (), {"pages": []})()
+            self.context = context or Context()
 
         def is_closed(self):
             return self.closed
@@ -1810,16 +2183,16 @@ def test_edge_streak_unexpected_new_page_is_cleaned_by_finally(monkeypatch, clic
             return EmptyLocator()
 
         def wait_for_timeout(self, _ms):
-            if self.delayed not in self.context.pages:
-                self.context.pages.append(self.delayed)
+            if self.context.next_page is None:
+                self.context.next_page = self.delayed
 
     dashboard = Page("dashboard", "https://rewards.bing.com/dashboard")
     activity = Page(
         "activity", "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
     )
-    delayed = Page("delayed", "about:blank")
+    delayed = Page("delayed", "about:blank", activity.context)
     delayed.wait_for_timeout = lambda _ms: None
-    historical = Page("historical", "https://example.com/user-tab")
+    historical = Page("historical", "https://example.com/user-tab", activity.context)
     activity.delayed = delayed
     activity.context.pages = [historical, dashboard, activity]
     dashboard.context = activity.context
@@ -2094,18 +2467,21 @@ def test_prepare_edge_streak_returns_opened_page_when_redirect_times_out(monkeyp
             return None
 
         def click(self):
-            self.page.context.pages.append(self.page.opened)
+            self.page.context.next_page = self.page.opened
+
+    class Context(_ExpectPageContext):
+        pass
 
     class Page:
         url = "https://rewards.bing.com/dashboard"
 
-        def __init__(self, name, url=None):
+        def __init__(self, name, url=None, context=None):
             self.name = name
             if url is not None:
                 self.url = url
             self.opened = None
             self.closed = False
-            self.context = type("Context", (), {"pages": [self]})()
+            self.context = context or Context()
 
         def is_closed(self):
             return self.closed
@@ -2124,10 +2500,12 @@ def test_prepare_edge_streak_returns_opened_page_when_redirect_times_out(monkeyp
             return None
 
     page = Page("dashboard")
+    page.context.pages = [page]
     page.opened = Page(
-        "opened", "https://www.microsoft.com/edge/launch/rewards-browsing-streak1"
+        "opened",
+        "https://www.microsoft.com/edge/launch/rewards-browsing-streak1",
+        page.context,
     )
-    page.opened.context = page.context
     monkeypatch.setattr(tasks, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 1)
 
     entry = tasks._prepare_edge_streak(page)
@@ -2600,16 +2978,16 @@ def test_run_account_invokes_streak_tasks(monkeypatch):
     monkeypatch.setattr(main_module, "do_dashboard_activities", lambda *a, **k: 0)
     monkeypatch.setattr(main_module, "do_daily_offer_tasks", lambda *a, **k: 0)
     monkeypatch.setattr(main_module, "do_point_punch_cards", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_edge_browsing_streak", lambda *a, **k: calls.append("edge") or 1)
+    monkeypatch.setattr(main_module, "do_edge_browsing_streak_detail", lambda *a, **k: calls.append(("edge", k.get("expected_email"))) or EdgeStreakResult(EdgeStreakStatus.COMPLETED, progress=(30, 30)))
     monkeypatch.setattr(main_module, "mobile_checkin", lambda *a, **k: calls.append("mobile") or 1)
-    monkeypatch.setattr(main_module, "run_rewards_desktop_task", lambda: calls.append("webview") or 0)
+    monkeypatch.setattr(main_module, "run_rewards_desktop_task", lambda *a, **k: calls.append(("webview", a[0] if a else k.get("expected_email"))) or 0)
     monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.PROJECT_ROOT / "real-edge-profile")
     monkeypatch.setattr(main_module, "DEFAULT_PC_SEARCHES", 0)
     monkeypatch.setattr(main_module, "DEFAULT_MOBILE_SEARCHES", 0)
     # Use a minimal page factory; all real interactions are stubbed.
     ctx = type("C", (), {"new_page": lambda self: Page()})()
     main_module.run_account(None, ctx, "u", "p", True)
-    assert calls == ["edge", "mobile", "webview"]
+    assert calls == [("edge", "u"), "mobile", ("webview", "u")]
 
 
 def _run_account_with_mobile_result(monkeypatch, mobile_result, devices, webview_result=0):
@@ -2643,11 +3021,11 @@ def _run_account_with_mobile_result(monkeypatch, mobile_result, devices, webview
     monkeypatch.setattr(main_module, "do_dashboard_activities", lambda *a, **k: 0)
     monkeypatch.setattr(main_module, "do_daily_offer_tasks", lambda *a, **k: 0)
     monkeypatch.setattr(main_module, "do_point_punch_cards", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_edge_browsing_streak", lambda *a, **k: calls.append("edge") or 1)
+    monkeypatch.setattr(main_module, "do_edge_browsing_streak_detail", lambda *a, **k: calls.append(("edge", k.get("expected_email"))) or EdgeStreakResult(EdgeStreakStatus.COMPLETED, progress=(30, 30)))
     monkeypatch.setattr(main_module, "mobile_checkin", lambda *a, **k: calls.append("mobile") or mobile_result)
     monkeypatch.setattr(main_module, "list_android_devices", lambda: devices)
     monkeypatch.setattr(main_module, "ENABLE_MOBILE_CLIENT", True)
-    monkeypatch.setattr(main_module, "run_rewards_desktop_task", lambda: calls.append("webview") or webview_result)
+    monkeypatch.setattr(main_module, "run_rewards_desktop_task", lambda *a, **k: calls.append(("webview", a[0] if a else k.get("expected_email"))) or webview_result)
     monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.PROJECT_ROOT / "real-edge-profile")
     monkeypatch.setattr(main_module, "DEFAULT_PC_SEARCHES", 0)
     monkeypatch.setattr(main_module, "DEFAULT_MOBILE_SEARCHES", 0)
@@ -2661,7 +3039,7 @@ def test_run_account_skips_mobile_without_android_device(monkeypatch, capsys):
     )
 
     assert result is True
-    assert calls == ["edge", "mobile", "webview"]
+    assert calls == [("edge", "u"), "mobile", ("webview", "u")]
     assert len(claim_calls) == 4
     assert "未连接 Android 设备，跳过必应应用签到" in capsys.readouterr().out
 
@@ -2672,9 +3050,31 @@ def test_run_account_does_not_report_mobile_success_when_device_present(monkeypa
     )
 
     assert result is False
-    assert calls == ["edge", "mobile"]
+    assert calls == [("edge", "u"), "mobile"]
     assert len(claim_calls) == 3
     assert "必应应用签到未确认" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (clients.REWARDS_DESKTOP_IDENTITY_UNVERIFIED, "WebView 无法确认桌面应用账号身份"),
+        (clients.REWARDS_DESKTOP_IDENTITY_MISMATCH, "WebView 桌面应用账号与目标账号不一致"),
+        (clients.REWARDS_DESKTOP_TASK_ITEM_MISSING, "WebView 已进入任务页但未找到可点击任务项"),
+    ],
+)
+def test_run_account_fails_on_unsafe_webview_states(monkeypatch, capsys, status, message):
+    result, calls, claim_calls = _run_account_with_mobile_result(
+        monkeypatch,
+        mobile_result=1,
+        devices=[],
+        webview_result=status,
+    )
+
+    assert result is False
+    assert calls == [("edge", "u"), "mobile", ("webview", "u")]
+    assert len(claim_calls) == 3
+    assert message in capsys.readouterr().out
 
 
 def test_run_account_skips_webview_when_uia_environment_unavailable(monkeypatch, capsys):
@@ -2686,7 +3086,7 @@ def test_run_account_skips_webview_when_uia_environment_unavailable(monkeypatch,
     )
 
     assert result is True
-    assert calls == ["edge", "mobile", "webview"]
+    assert calls == [("edge", "u"), "mobile", ("webview", "u")]
     assert len(claim_calls) == 4
     assert "WebView UIA 不可用，跳过（不影响其他任务）" in capsys.readouterr().out
 
@@ -2700,7 +3100,7 @@ def test_run_account_fails_on_actual_webview_task_error(monkeypatch, capsys):
     )
 
     assert result is False
-    assert calls == ["edge", "mobile", "webview"]
+    assert calls == [("edge", "u"), "mobile", ("webview", "u")]
     assert len(claim_calls) == 3
     assert "Rewards 桌面 WebView 任务执行失败，账号不报告成功" in capsys.readouterr().out
 
@@ -2714,7 +3114,7 @@ def test_run_account_succeeds_when_webview_has_no_task(monkeypatch):
     )
 
     assert result is True
-    assert calls == ["edge", "mobile", "webview"]
+    assert calls == [("edge", "u"), "mobile", ("webview", "u")]
     assert len(claim_calls) == 4
 
 
@@ -2727,7 +3127,7 @@ def test_run_account_succeeds_when_webview_task_grows(monkeypatch):
     )
 
     assert result is True
-    assert calls == ["edge", "mobile", "webview"]
+    assert calls == [("edge", "u"), "mobile", ("webview", "u")]
     assert len(claim_calls) == 4
 
 
@@ -2752,15 +3152,106 @@ def test_run_account_skips_edge_streak_on_isolation_profile(monkeypatch):
     monkeypatch.setattr(main_module, "do_dashboard_activities", lambda *a, **k: 0)
     monkeypatch.setattr(main_module, "do_daily_offer_tasks", lambda *a, **k: 0)
     monkeypatch.setattr(main_module, "do_point_punch_cards", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_edge_browsing_streak", lambda *a, **k: calls.append("edge"))
+    monkeypatch.setattr(main_module, "do_edge_browsing_streak_detail", lambda *a, **k: calls.append("edge") or EdgeStreakResult(EdgeStreakStatus.COMPLETED, progress=(30, 30)))
     monkeypatch.setattr(main_module, "mobile_checkin", lambda *a, **k: calls.append("mobile") or 1)
-    monkeypatch.setattr(main_module, "run_rewards_desktop_task", lambda: 0)
+    monkeypatch.setattr(main_module, "run_rewards_desktop_task", lambda *a, **k: 0)
     monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.USER_DATA_DIR)
     monkeypatch.setattr(main_module, "DEFAULT_PC_SEARCHES", 0)
     monkeypatch.setattr(main_module, "DEFAULT_MOBILE_SEARCHES", 0)
     ctx = type("C", (), {"new_page": lambda self: Page()})()
     main_module.run_account(None, ctx, "u", "p", True)
     assert calls == ["mobile"]
+
+
+@pytest.mark.parametrize(
+    ("edge_status", "message"),
+    [
+        (EdgeStreakStatus.IDENTITY_UNVERIFIED, "Edge 浏览器 profile 无法确认目标账号"),
+        (EdgeStreakStatus.IDENTITY_MISMATCH, "Edge 浏览器 profile 账号与目标账号不一致"),
+        (EdgeStreakStatus.INVALID_PROGRESS, "Edge 浏览进度异常"),
+        (EdgeStreakStatus.ENTRY_FAILED, "Edge 浏览任务失败"),
+    ],
+)
+def test_run_account_edge_identity_failure_cannot_be_overridden_by_30_30(
+    monkeypatch, capsys, edge_status, message
+):
+    import main as main_module
+
+    class Page:
+        url = "https://rewards.bing.com/dashboard"
+
+        def goto(self, *_a, **_k):
+            pass
+
+        def wait_for_timeout(self, *_):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(main_module, "ensure_account", lambda *a, **k: True)
+    monkeypatch.setattr(main_module, "safe_goto", lambda *a, **k: None)
+    monkeypatch.setattr(main_module, "detect_risk_control", lambda _p: None)
+    monkeypatch.setattr(main_module, "parse_dashboard_data", lambda _p: {
+        "claimable_points": 0, "daily_set_items": [],
+        "daily_activities_done": 3, "daily_activities_total": 3,
+        "pc_search_done": 0, "pc_search_total": 0,
+    })
+    monkeypatch.setattr(main_module, "claim_available_points", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_daily_set_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_dashboard_activities", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_daily_offer_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_point_punch_cards", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        main_module,
+        "do_edge_browsing_streak_detail",
+        lambda *a, **k: EdgeStreakResult(edge_status, progress=(30, 30)),
+    )
+    monkeypatch.setattr(main_module, "read_streak_progress", lambda *a, **k: (30, 30))
+    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.PROJECT_ROOT / "real-edge-profile")
+    monkeypatch.setattr(main_module, "DEFAULT_PC_SEARCHES", 0)
+    monkeypatch.setattr(main_module, "DEFAULT_MOBILE_SEARCHES", 0)
+    ctx = type("C", (), {"new_page": lambda self: Page()})()
+
+    assert main_module.run_account(None, ctx, "u", "p", True) is False
+    assert message in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("invalid_progress", [(31, 30), (-1, 30), (0, 0), (1, 0)])
+def test_run_account_rejects_invalid_edge_recheck_progress(monkeypatch, invalid_progress):
+    import main as main_module
+
+    class Page:
+        url = "https://rewards.bing.com/dashboard"
+        def goto(self, *_a, **_k): pass
+        def wait_for_timeout(self, *_): pass
+        def close(self): pass
+
+    monkeypatch.setattr(main_module, "ensure_account", lambda *a, **k: True)
+    monkeypatch.setattr(main_module, "safe_goto", lambda *a, **k: None)
+    monkeypatch.setattr(main_module, "detect_risk_control", lambda _p: None)
+    monkeypatch.setattr(main_module, "parse_dashboard_data", lambda _p: {
+        "claimable_points": 0, "daily_set_items": [],
+        "daily_activities_done": 3, "daily_activities_total": 3,
+        "pc_search_done": 0, "pc_search_total": 0,
+    })
+    monkeypatch.setattr(main_module, "claim_available_points", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_daily_set_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_dashboard_activities", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_daily_offer_tasks", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_point_punch_cards", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        main_module,
+        "do_edge_browsing_streak_detail",
+        lambda *a, **k: EdgeStreakResult(EdgeStreakStatus.INCOMPLETE, progress=(10, 30)),
+    )
+    monkeypatch.setattr(main_module, "read_streak_progress", lambda *a, **k: invalid_progress)
+    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.PROJECT_ROOT / "real-edge-profile")
+    monkeypatch.setattr(main_module, "DEFAULT_PC_SEARCHES", 0)
+    monkeypatch.setattr(main_module, "DEFAULT_MOBILE_SEARCHES", 0)
+    ctx = type("C", (), {"new_page": lambda self: Page()})()
+
+    assert main_module.run_account(None, ctx, "u", "p", True) is False
 
 
 def test_run_account_returns_false_when_edge_streak_incomplete(monkeypatch):
@@ -2782,7 +3273,7 @@ def test_run_account_returns_false_when_edge_streak_incomplete(monkeypatch):
     monkeypatch.setattr(main_module, "do_dashboard_activities", lambda *a, **k: 0)
     monkeypatch.setattr(main_module, "do_daily_offer_tasks", lambda *a, **k: 0)
     monkeypatch.setattr(main_module, "do_point_punch_cards", lambda *a, **k: 0)
-    monkeypatch.setattr(main_module, "do_edge_browsing_streak", lambda *a, **k: 0)
+    monkeypatch.setattr(main_module, "do_edge_browsing_streak_detail", lambda *a, **k: EdgeStreakResult(EdgeStreakStatus.INCOMPLETE, progress=(10, 30)))
     monkeypatch.setattr(main_module, "read_streak_progress", lambda *a, **k: (10, 30))
     monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.PROJECT_ROOT / "real-edge-profile")
     monkeypatch.setattr(main_module, "DEFAULT_PC_SEARCHES", 0)
@@ -2827,7 +3318,7 @@ def test_mobile_checkin_returns_zero_without_device(monkeypatch):
 
 
 def test_rewards_desktop_state_available_shape(monkeypatch):
-    monkeypatch.setattr(clients, "_rewards_uia", lambda mode="state": {
+    monkeypatch.setattr(clients, "_rewards_uia", lambda mode="state", expected_email=None: {
         "available": False, "task_progress": None, "success": False, "output": "",
     })
     result = clients.rewards_desktop_state()
@@ -2836,27 +3327,48 @@ def test_rewards_desktop_state_available_shape(monkeypatch):
 
 
 def test_rewards_desktop_state_parses_progress_and_uia_ready(monkeypatch):
-    monkeypatch.setattr(clients, "_rewards_desktop_hwnd", lambda: 123)
-    monkeypatch.setattr(clients, "REWARDS_DESKTOP_UIA_RESULT", config.PROJECT_ROOT / "tmp_missing_uia_result.txt")
-    class Result:
-        returncode = 0
-        stdout = "AVAILABLE=1\nDOC=桌面奖励应用每周专属任务 – Microsoft Rewards\nTASK_PROGRESS=3/8\n"
-    monkeypatch.setattr(clients.subprocess, "run", lambda *a, **k: Result())
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\nDOC=桌面奖励应用每周专属任务 – Microsoft Rewards\nTASK_PROGRESS=3/8\n",
+    )
     result = clients.rewards_desktop_state()
     assert result["available"] is True
     assert result["task_progress"] == "3/8"
     assert result["uia_ready"] is True
 
 
-def _fake_rewards_uia_output(monkeypatch, output):
+def _fake_rewards_uia_output(
+    monkeypatch,
+    output,
+    *,
+    returncode=0,
+    run_id_override=None,
+    write_result=True,
+    captured=None,
+    side_effect=None,
+):
     monkeypatch.setattr(clients, "_rewards_desktop_hwnd", lambda: 123)
-    monkeypatch.setattr(clients, "REWARDS_DESKTOP_UIA_RESULT", config.PROJECT_ROOT / "tmp_missing_uia_result.txt")
 
-    class Result:
-        returncode = 0
-        stdout = output
+    def fake_run(args, **kwargs):
+        if captured is not None:
+            captured.append(list(args))
+        if side_effect is not None:
+            raise side_effect
+        result_path = Path(args[args.index("-ResultPath") + 1])
+        run_id = args[args.index("-RunId") + 1] if "-RunId" in args else ""
+        content = f"RUN_ID={run_id_override or run_id}\n{output}"
+        if write_result:
+            result_path.write_text(content, encoding="utf-8")
 
-    monkeypatch.setattr(clients.subprocess, "run", lambda *a, **k: Result())
+        class Result:
+            pass
+
+        result = Result()
+        result.returncode = returncode
+        result.stdout = output
+        return result
+
+    monkeypatch.setattr(clients.subprocess, "run", fake_run)
 
 
 def test_rewards_desktop_home_without_task_is_safe_noop(monkeypatch):
@@ -3035,8 +3547,59 @@ def test_rewards_desktop_run_reports_uia_environment_unavailable(monkeypatch):
         "task_progress": None,
         "success": False,
         "uia_ready": False,
-        "output": "",
+        "uia_unavailable": True,
+        "output": "AVAILABLE=1\nUIA_READY=0\n",
     })
+    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_UIA_UNAVAILABLE
+
+
+def test_rewards_desktop_timeout_is_task_error_not_uia_unavailable(monkeypatch):
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "",
+        write_result=False,
+        side_effect=subprocess.TimeoutExpired(cmd="powershell.exe", timeout=90),
+    )
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+
+    result = clients.rewards_desktop_state()
+    assert result["protocol_error"] is True
+    assert result["uia_unavailable"] is False
+    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+
+
+def test_rewards_desktop_oserror_is_task_error_not_uia_unavailable(monkeypatch):
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "",
+        write_result=False,
+        side_effect=OSError("cannot launch powershell"),
+    )
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+
+    result = clients.rewards_desktop_state()
+    assert result["protocol_error"] is True
+    assert result["uia_unavailable"] is False
+    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "AVAILABLE=0\nERROR=NO_PROCESS\n",
+        "AVAILABLE=1\nUIA_READY=0\nTASK_STATE=uia_unavailable\nERROR=RootWebArea not found\n",
+    ],
+)
+def test_rewards_desktop_explicit_uia_unavailable_still_skips(monkeypatch, output):
+    _fake_rewards_uia_output(monkeypatch, output)
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+
+    result = clients.rewards_desktop_state()
+    assert result["uia_unavailable"] is True
+    assert result["protocol_error"] is False
     assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_UIA_UNAVAILABLE
 
 
@@ -3066,6 +3629,229 @@ def test_rewards_desktop_run_returns_success_after_progress_growth(monkeypatch):
         "output": "",
     })
     assert clients.run_rewards_desktop_task() == 1
+
+
+def test_rewards_desktop_identity_mismatch_blocks_task_click(monkeypatch):
+    calls = []
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\n"
+        "DOC=首页 – Microsoft Rewards\n"
+        "UIA_READY=1\n"
+        "DESKTOP_IDENTITY=other@example.invalid\n"
+        "IDENTITY_STATE=identity_mismatch\n"
+        "SUCCESS=0\n",
+        captured=calls,
+    )
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+
+    assert clients.run_rewards_desktop_task("target@example.invalid") == (
+        clients.REWARDS_DESKTOP_IDENTITY_MISMATCH
+    )
+    assert "-ExpectedEmail" in calls[0]
+    assert "target@example.invalid" in calls[0]
+
+
+def test_rewards_desktop_identity_unverified_blocks_task_click(monkeypatch):
+    captured = []
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\n"
+        "DOC=首页 – Microsoft Rewards\n"
+        "UIA_READY=1\n"
+        "DESKTOP_IDENTITY=target@example.invalid\n"
+        "IDENTITY_STATE=identity_unverified\n"
+        "SUCCESS=1\n",
+        captured=captured,
+    )
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+
+    state = clients.rewards_desktop_state("target@example.invalid")
+    assert state["success"] is False
+    assert clients.run_rewards_desktop_task("target@example.invalid") == (
+        clients.REWARDS_DESKTOP_IDENTITY_UNVERIFIED
+    )
+    assert "-ExpectedEmail" in captured[0]
+
+
+def test_rewards_desktop_verified_identity_continues_task_flow(monkeypatch):
+    captured = []
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\n"
+        "DOC=桌面奖励应用每周专属任务 – Microsoft Rewards\n"
+        "UIA_READY=1\n"
+        "DESKTOP_IDENTITY=Target@Example.invalid\n"
+        "IDENTITY_STATE=verified\n"
+        "TASK_STATE=task\n"
+        "TASK_BEFORE=1/3\n"
+        "TASK_AFTER=2/3\n"
+        "SUCCESS=1\n",
+        captured=captured,
+    )
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+
+    assert clients.run_rewards_desktop_task("target@example.invalid") == (
+        clients.REWARDS_DESKTOP_TASK_GROWN
+    )
+    assert "target@example.invalid" in captured[0]
+
+
+def test_rewards_desktop_rejects_run_id_mismatch(monkeypatch):
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\n"
+        "DOC=桌面奖励应用每周专属任务 – Microsoft Rewards\n"
+        "UIA_READY=1\n"
+        "TASK_STATE=task\n"
+        "TASK_BEFORE=1/3\n"
+        "TASK_AFTER=2/3\n"
+        "SUCCESS=1\n",
+        run_id_override="stale-run-id",
+    )
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+
+    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+
+
+def test_rewards_desktop_rejects_nonzero_powershell_exit(monkeypatch):
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\n"
+        "UIA_READY=1\n"
+        "TASK_STATE=task\n"
+        "TASK_AFTER=2/3\n"
+        "SUCCESS=1\n",
+        returncode=1,
+    )
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+
+    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+
+
+def test_rewards_desktop_does_not_read_legacy_fixed_result_file(
+    monkeypatch, tmp_path
+):
+    legacy_result = tmp_path / "tmp_rewards_desktop_result.txt"
+    legacy_result.write_text(
+        "AVAILABLE=1\nTASK_STATE=task\nTASK_AFTER=2/3\nSUCCESS=1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(clients, "REWARDS_DESKTOP_UIA_RESULT", legacy_result)
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\nUIA_READY=1\nTASK_STATE=error\nERROR=boom\n",
+        write_result=False,
+    )
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+
+    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+
+
+def test_rewards_desktop_task_invoke_failed_is_error(monkeypatch):
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\n"
+        "DOC=桌面奖励应用每周专属任务 – Microsoft Rewards\n"
+        "UIA_READY=1\n"
+        "TASK_STATE=task\n"
+        "TASK_ELEMENT_TYPE=ControlType.Hyperlink\n"
+        "TASK_ERROR=weekly_item_not_invokable\n"
+        "SUCCESS=0\n",
+    )
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+
+    result = clients.rewards_desktop_state()
+    assert result["task_state"] == "error"
+    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+
+
+def test_rewards_desktop_identity_comparison_is_case_insensitive(monkeypatch):
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\n"
+        "DOC=桌面奖励应用每周专属任务 – Microsoft Rewards\n"
+        "UIA_READY=1\n"
+        "DESKTOP_IDENTITY=Target@Example.invalid\n"
+        "IDENTITY_STATE=verified\n"
+        "TASK_STATE=no_task\n"
+        "SUCCESS=0\n",
+    )
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+
+    assert clients.run_rewards_desktop_task("target@example.invalid") == (
+        clients.REWARDS_DESKTOP_NO_TASK
+    )
+
+
+def test_rewards_desktop_task_page_without_task_item_is_failure(monkeypatch):
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\n"
+        "DOC=桌面奖励应用每周专属任务 – Microsoft Rewards\n"
+        "UIA_READY=1\n"
+        "TASK_STATE=task\n"
+        "TASK=0\n"
+        "SUCCESS=0\n",
+    )
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+
+    result = clients.rewards_desktop_state()
+    assert result["task_state"] == "task_item_missing"
+    assert result["error"] is True
+    assert clients.run_rewards_desktop_task() == (
+        clients.REWARDS_DESKTOP_TASK_ITEM_MISSING
+    )
+
+
+def test_rewards_desktop_powershell_state_smoke_writes_run_id(tmp_path):
+    """真实执行脚本初始化路径；不依赖 Rewards 窗口，不点击任务。"""
+    script = Path(__file__).resolve().parents[1] / "utils" / "rewards_desktop_uia.ps1"
+    result_path = tmp_path / "smoke_result.txt"
+    run_id = "smoke-run-id"
+    proc = subprocess.run(
+        [
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+            "-ExecutionPolicy", "Bypass", "-File", str(script),
+            "-Mode", "state", "-Hwnd", "0", "-RunId", run_id,
+            "-ResultPath", str(result_path),
+        ],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert result_path.is_file()
+    output = result_path.read_text(encoding="utf-8-sig")
+    assert f"RUN_ID={run_id}" in output
+    assert "SHELL" not in output
+
+
+def test_rewards_desktop_each_call_uses_and_removes_unique_result_file(monkeypatch):
+    captured = []
+    _fake_rewards_uia_output(
+        monkeypatch,
+        "AVAILABLE=1\nUIA_READY=1\nTASK_STATE=no_task\nSUCCESS=0\n",
+        captured=captured,
+    )
+    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+
+    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_NO_TASK
+    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_NO_TASK
+    first = Path(captured[0][captured[0].index("-ResultPath") + 1])
+    second = Path(captured[1][captured[1].index("-ResultPath") + 1])
+    assert first != second
+    assert not first.exists()
+    assert not second.exists()
 
 
 def test_mobile_checkin_taps_check_in_and_confirms_checked(monkeypatch):
