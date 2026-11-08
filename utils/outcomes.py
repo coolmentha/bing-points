@@ -72,10 +72,16 @@ class AccountOutcome:
     tasks: tuple[TaskOutcome, ...] = ()
     final_claim_status: TaskStatus = TaskStatus.SUCCESS
     error: str = ""
+    required_task_names: frozenset[str] = frozenset()
 
     @property
     def success(self) -> bool:
-        """仅当所有必需任务和最终领取均成功时，账号才算成功。"""
+        """仅当完整必需任务集合和最终领取均成功时，账号才算成功。"""
+        recorded = {task.name for task in self.tasks}
+        if not recorded or not self.required_task_names:
+            return False
+        if not self.required_task_names.issubset(recorded):
+            return False
         required_tasks_succeeded = all(
             task.status is TaskStatus.SUCCESS
             for task in self.tasks

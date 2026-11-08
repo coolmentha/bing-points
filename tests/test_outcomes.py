@@ -32,6 +32,7 @@ def test_account_success_requires_every_required_task_to_succeed():
             _task("daily", TaskStatus.SUCCESS),
             _task("edge", TaskStatus.FAILED),
         ),
+        required_task_names=frozenset({"daily", "edge"}),
     )
 
     assert account.success is False
@@ -46,6 +47,7 @@ def test_optional_task_failure_does_not_fail_account():
             _task("android", TaskStatus.ENVIRONMENT_UNAVAILABLE, required=False),
             _task("webview", TaskStatus.SKIPPED, required=False),
         ),
+        required_task_names=frozenset({"daily"}),
     )
 
     assert account.success is True
@@ -57,9 +59,23 @@ def test_account_success_requires_final_claim_success():
         account="user@example.invalid",
         tasks=(_task("daily", TaskStatus.SUCCESS),),
         final_claim_status=TaskStatus.FAILED,
+        required_task_names=frozenset({"daily"}),
     )
 
     assert account.success is False
+
+
+def test_account_success_requires_complete_required_task_set():
+    only_login = AccountOutcome(
+        account="user@example.invalid",
+        tasks=(_task("login", TaskStatus.SUCCESS),),
+        final_claim_status=TaskStatus.SUCCESS,
+        required_task_names=frozenset({"login", "daily_set", "final_claim"}),
+    )
+    assert only_login.success is False
+
+    empty = AccountOutcome(account="user@example.invalid")
+    assert empty.success is False
 
 
 def test_identity_statuses_are_not_treated_as_success():
@@ -69,6 +85,7 @@ def test_identity_statuses_are_not_treated_as_success():
             _task("edge", TaskStatus.IDENTITY_MISMATCH),
             _task("webview", TaskStatus.IDENTITY_UNVERIFIED),
         ),
+        required_task_names=frozenset({"edge", "webview"}),
     )
 
     assert account.success is False
@@ -89,6 +106,7 @@ def test_all_accounts_success():
     account = AccountOutcome(
         account="user@example.invalid",
         tasks=(_task("daily", TaskStatus.SUCCESS),),
+        required_task_names=frozenset({"daily"}),
     )
 
     assert summarize_accounts((account,)) == (RunStatus.SUCCESS, ExitCode.SUCCESS)
@@ -98,10 +116,12 @@ def test_partial_failure_is_not_reported_as_success():
     ok = AccountOutcome(
         account="ok@example.invalid",
         tasks=(_task("daily", TaskStatus.SUCCESS),),
+        required_task_names=frozenset({"daily"}),
     )
     failed = AccountOutcome(
         account="failed@example.invalid",
         tasks=(_task("daily", TaskStatus.FAILED),),
+        required_task_names=frozenset({"daily"}),
     )
 
     assert summarize_accounts((ok, failed)) == (
@@ -114,6 +134,7 @@ def test_all_accounts_failed():
     failed = AccountOutcome(
         account="failed@example.invalid",
         tasks=(_task("daily", TaskStatus.FAILED),),
+        required_task_names=frozenset({"daily"}),
     )
 
     assert summarize_accounts((failed,)) == (
