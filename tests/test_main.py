@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from utils import accounts, browser, clients, config, dashboard, tasks, trends
+from utils import accounts, browser, clients, config, dashboard, edge_streak, tasks, trends
 from utils.tasks import EdgeStreakResult, EdgeStreakStatus
 
 
@@ -37,7 +37,7 @@ def edge_browser_logged_in(tmp_path_factory, monkeypatch):
         }),
         encoding="utf-8",
     )
-    monkeypatch.setattr(tasks, "EDGE_USER_DATA_DIR", root)
+    monkeypatch.setattr(edge_streak, "edge_user_data_dir", root)
 
 
 # ======================== 账号管理 ========================
@@ -1294,12 +1294,12 @@ def test_edge_profile_identity_corrupt_json_is_unknown(tmp_path):
 def test_edge_streak_rejects_unexpected_profile_before_opening(monkeypatch, capsys):
     page = type("Page", (), {"url": "https://rewards.bing.com/dashboard"})()
     actions = []
-    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: (0, 30))
-    monkeypatch.setattr(tasks, "edge_browser_profile_matches", lambda *_args: False)
+    monkeypatch.setattr(edge_streak, "read_streak_progress", lambda *_args: (0, 30))
+    monkeypatch.setattr(edge_streak, "edge_browser_profile_matches", lambda *_args: False)
     monkeypatch.setattr(
-        tasks,
+        edge_streak,
         "_prepare_edge_streak",
-        lambda *_args: actions.append("open") or tasks.EdgeStreakEntry(page, (), False),
+        lambda *_args: actions.append("open") or edge_streak.EdgeStreakEntry(page, (), False),
     )
 
     assert tasks.do_edge_browsing_streak(
@@ -1312,22 +1312,22 @@ def test_edge_streak_rejects_unexpected_profile_before_opening(monkeypatch, caps
 
 def test_edge_streak_identity_mismatch_cannot_be_overridden_by_complete_progress(monkeypatch):
     page = type("Page", (), {"url": "https://rewards.bing.com/dashboard"})()
-    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: (30, 30))
+    monkeypatch.setattr(edge_streak, "read_streak_progress", lambda *_args: (30, 30))
     monkeypatch.setattr(
-        tasks, "edge_profile_identity", lambda *_args: "other@example.invalid"
+        edge_streak, "edge_profile_identity", lambda *_args: "other@example.invalid"
     )
     opened = []
     monkeypatch.setattr(
-        tasks,
+        edge_streak,
         "_prepare_edge_streak",
-        lambda *_args: opened.append(True) or tasks.EdgeStreakEntry(page, (), False),
+        lambda *_args: opened.append(True) or edge_streak.EdgeStreakEntry(page, (), False),
     )
 
     result = tasks.do_edge_browsing_streak_detail(
         page, expected_email="target@example.invalid"
     )
 
-    assert result.status is tasks.EdgeStreakStatus.IDENTITY_MISMATCH
+    assert result.status is edge_streak.EdgeStreakStatus.IDENTITY_MISMATCH
     assert result.progress is None
     assert result.success is False
     assert opened == []
@@ -1338,13 +1338,13 @@ def test_edge_streak_identity_mismatch_cannot_be_overridden_by_complete_progress
 
 def test_edge_streak_identity_unverified_is_explicit(monkeypatch):
     page = type("Page", (), {"url": "https://rewards.bing.com/dashboard"})()
-    monkeypatch.setattr(tasks, "edge_profile_identity", lambda *_args: None)
+    monkeypatch.setattr(edge_streak, "edge_profile_identity", lambda *_args: None)
 
     result = tasks.do_edge_browsing_streak_detail(
         page, expected_email="target@example.invalid"
     )
 
-    assert result.status is tasks.EdgeStreakStatus.IDENTITY_UNVERIFIED
+    assert result.status is edge_streak.EdgeStreakStatus.IDENTITY_UNVERIFIED
     assert result.success is False
 
 
@@ -1361,12 +1361,12 @@ def test_valid_edge_progress_accepts_inclusive_range(progress):
 @pytest.mark.parametrize("progress", [(0, 0), (1, 0), (-1, 30), (31, 30)])
 def test_edge_streak_rejects_invalid_progress(monkeypatch, progress):
     page = type("Page", (), {"url": "https://rewards.bing.com/dashboard"})()
-    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: progress)
-    monkeypatch.setattr(tasks, "edge_browser_profile_logged_in", lambda *_args: True)
+    monkeypatch.setattr(edge_streak, "read_streak_progress", lambda *_args: progress)
+    monkeypatch.setattr(edge_streak, "edge_browser_profile_logged_in", lambda *_args: True)
 
     result = tasks.do_edge_browsing_streak_detail(page)
 
-    assert result.status is tasks.EdgeStreakStatus.INVALID_PROGRESS
+    assert result.status is edge_streak.EdgeStreakStatus.INVALID_PROGRESS
     assert result.success is False
     assert tasks.do_edge_browsing_streak(page) == 0
 
@@ -1472,7 +1472,7 @@ def test_prepare_edge_streak_does_not_adopt_unowned_historical_activity_page(mon
     historical.context = context
     context.pages = [historical, page]
     page.historical_activity = historical
-    monkeypatch.setattr(tasks, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 1)
+    monkeypatch.setattr(edge_streak, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 1)
 
     entry = tasks._prepare_edge_streak(page)
 
@@ -1564,9 +1564,9 @@ def test_edge_streak_expect_page_owns_only_clicked_tabs(monkeypatch):
     activity.activation = activation
 
     progress = iter([(0, 30), (30, 30)])
-    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: next(progress))
-    monkeypatch.setattr(tasks, "safe_goto", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(tasks, "edge_browser_profile_logged_in", lambda *_args: True)
+    monkeypatch.setattr(edge_streak, "read_streak_progress", lambda *_args: next(progress))
+    monkeypatch.setattr(edge_streak, "safe_goto", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(edge_streak, "edge_browser_profile_logged_in", lambda *_args: True)
 
     assert tasks.do_edge_browsing_streak(dashboard, minutes=1, poll_seconds=60) == 1
     assert activity.closed is True
@@ -1611,7 +1611,7 @@ def test_open_edge_streak_waits_for_delayed_redirect():
     class Target:
         def __init__(self, page):
             self.page = page
-            self.url = tasks.EDGE_STREAK_LAUNCH_URL
+            self.url = edge_streak.EDGE_STREAK_LAUNCH_URL
             self.closed = False
 
         def is_closed(self):
@@ -1709,7 +1709,7 @@ def test_edge_streak_wait_skips_bad_and_closed_pages_and_finds_new_target():
     result = tasks._wait_for_edge_streak_target(
         page,
         [page, page.bad, page.closed_page],
-        tasks.EDGE_STREAK_REDIRECT_TIMEOUT_MS,
+        edge_streak.EDGE_STREAK_REDIRECT_TIMEOUT_MS,
         existing_pages={page},
     )
     assert result is page.target
@@ -1724,7 +1724,7 @@ def test_edge_streak_wait_skips_is_closed_error_and_finds_later_redirect(monkeyp
 
     class DelayedTarget:
         def __init__(self):
-            self.url = tasks.EDGE_STREAK_LAUNCH_URL
+            self.url = edge_streak.EDGE_STREAK_LAUNCH_URL
             self.closed = False
 
         def is_closed(self):
@@ -1750,12 +1750,12 @@ def test_edge_streak_wait_skips_is_closed_error_and_finds_later_redirect(monkeyp
             )
 
     page = Page()
-    monkeypatch.setattr(tasks, "EDGE_STREAK_POLL_INTERVAL_MS", 1)
+    monkeypatch.setattr(edge_streak, "EDGE_STREAK_POLL_INTERVAL_MS", 1)
 
     result = tasks._wait_for_edge_streak_target(
         page,
         [page, page.broken],
-        tasks.EDGE_STREAK_REDIRECT_TIMEOUT_MS,
+        edge_streak.EDGE_STREAK_REDIRECT_TIMEOUT_MS,
         existing_pages={page, page.broken},
     )
     assert result is page.target
@@ -1816,12 +1816,12 @@ def test_open_edge_streak_does_not_click_without_page_snapshot(monkeypatch):
 
     page = Page()
     calls = []
-    monkeypatch.setattr(tasks, "safe_goto", lambda *args, **kwargs: calls.append(args[1]))
-    monkeypatch.setattr(tasks, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 50)
+    monkeypatch.setattr(edge_streak, "safe_goto", lambda *args, **kwargs: calls.append(args[1]))
+    monkeypatch.setattr(edge_streak, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 50)
 
     assert tasks._open_edge_streak(page) is False
     assert page.link_clicked is False
-    assert calls == [tasks.EDGE_STREAK_LAUNCH_URL]
+    assert calls == [edge_streak.EDGE_STREAK_LAUNCH_URL]
     assert page.stale.closed is False
 
 
@@ -1863,8 +1863,8 @@ def test_open_edge_streak_ignores_stale_activity_page_when_fallback_does_not_nav
             return None
 
     page = Page()
-    monkeypatch.setattr(tasks, "safe_goto", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(tasks, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 50)
+    monkeypatch.setattr(edge_streak, "safe_goto", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(edge_streak, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 50)
 
     assert tasks._open_edge_streak(page) is False
     assert page.closed is False
@@ -1908,10 +1908,10 @@ def test_open_edge_streak_falls_back_to_official_launch_url(monkeypatch):
         calls.append(url)
         target.url = "https://rewards.bing.com/promo/edge-browsing-streak?form=ML2WHL"
 
-    monkeypatch.setattr(tasks, "safe_goto", fake_goto)
+    monkeypatch.setattr(edge_streak, "safe_goto", fake_goto)
 
     assert tasks._open_edge_streak(page) is True
-    assert calls == [tasks.EDGE_STREAK_LAUNCH_URL]
+    assert calls == [edge_streak.EDGE_STREAK_LAUNCH_URL]
 
 
 def test_edge_streak_activates_new_bing_page_and_closes_only_owned_pages(monkeypatch):
@@ -2017,25 +2017,25 @@ def test_edge_streak_activates_new_bing_page_and_closes_only_owned_pages(monkeyp
         prepare_calls.append(_target)
         if len(prepare_calls) == 1:
             context.pages.append(activity)
-            return tasks.EdgeStreakEntry(activity, (activity,), True)
+            return edge_streak.EdgeStreakEntry(activity, (activity,), True)
         context.pages.append(activity)
-        return tasks.EdgeStreakEntry(activity, (), False)
+        return edge_streak.EdgeStreakEntry(activity, (), False)
 
     def fake_goto(target, url, **_kwargs):
         if target is dashboard:
-            assert url == tasks.REWARDS_DASHBOARD
+            assert url == edge_streak.REWARDS_DASHBOARD
         else:
             assert target is activation
             browsing_calls.append((target, url))
 
-    monkeypatch.setattr(tasks, "read_streak_progress", fake_read)
-    monkeypatch.setattr(tasks, "_prepare_edge_streak", fake_prepare)
+    monkeypatch.setattr(edge_streak, "read_streak_progress", fake_read)
+    monkeypatch.setattr(edge_streak, "_prepare_edge_streak", fake_prepare)
     def fake_activation(*_args, **_kwargs):
         activity.link_clicked = True
-        return tasks.EdgeStreakActivation(activation, (activation,), True)
+        return edge_streak.EdgeStreakActivation(activation, (activation,), True)
 
-    monkeypatch.setattr(tasks, "_activate_edge_streak", fake_activation)
-    monkeypatch.setattr(tasks, "safe_goto", fake_goto)
+    monkeypatch.setattr(edge_streak, "_activate_edge_streak", fake_activation)
+    monkeypatch.setattr(edge_streak, "safe_goto", fake_goto)
 
     assert tasks.do_edge_browsing_streak(dashboard, minutes=6, poll_seconds=60) == 1
     assert activity.link_clicked is True
@@ -2136,7 +2136,7 @@ def test_activate_edge_streak_collects_page_created_after_click_timeout(monkeypa
     delayed.wait_for_timeout = lambda _ms: None
     activity.delayed = delayed
     activity.context.pages = [activity]
-    monkeypatch.setattr(tasks, "EDGE_STREAK_ACTIVATION_POLL_MS", 1)
+    monkeypatch.setattr(edge_streak, "EDGE_STREAK_ACTIVATION_POLL_MS", 1)
 
     result = tasks._activate_edge_streak(
         activity, timeout_ms=1, activation_timeout_ms=1
@@ -2207,7 +2207,7 @@ def test_activate_edge_streak_collects_page_when_click_raises(monkeypatch):
     delayed = Page("delayed", "about:blank", activity.context)
     activity.delayed = delayed
     activity.context.pages = [activity]
-    monkeypatch.setattr(tasks, "EDGE_STREAK_ACTIVATION_POLL_MS", 1)
+    monkeypatch.setattr(edge_streak, "EDGE_STREAK_ACTIVATION_POLL_MS", 1)
 
     result = tasks._activate_edge_streak(
         activity, timeout_ms=1, activation_timeout_ms=1
@@ -2287,17 +2287,17 @@ def test_edge_streak_unexpected_new_page_is_cleaned_by_finally(monkeypatch, clic
     dashboard.context = activity.context
     historical.context = activity.context
 
-    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: (0, 30))
+    monkeypatch.setattr(edge_streak, "read_streak_progress", lambda *_args: (0, 30))
     monkeypatch.setattr(
-        tasks,
+        edge_streak,
         "_prepare_edge_streak",
-        lambda _page: tasks.EdgeStreakEntry(activity, (activity,), True),
+        lambda _page: edge_streak.EdgeStreakEntry(activity, (activity,), True),
     )
-    monkeypatch.setattr(tasks, "EDGE_STREAK_ACTIVATION_TIMEOUT_MS", 1)
-    monkeypatch.setattr(tasks, "EDGE_STREAK_ACTIVATION_POLL_MS", 1)
+    monkeypatch.setattr(edge_streak, "EDGE_STREAK_ACTIVATION_TIMEOUT_MS", 1)
+    monkeypatch.setattr(edge_streak, "EDGE_STREAK_ACTIVATION_POLL_MS", 1)
     goto_calls = []
     monkeypatch.setattr(
-        tasks, "safe_goto", lambda target, url, **kwargs: goto_calls.append(target)
+        edge_streak, "safe_goto", lambda target, url, **kwargs: goto_calls.append(target)
     )
 
     assert tasks.do_edge_browsing_streak(dashboard, minutes=1, poll_seconds=60) == 0
@@ -2465,7 +2465,7 @@ def test_edge_streak_waits_for_delayed_activation_link(monkeypatch):
     dashboard.context = context
     activity.context = context
     context.pages = [dashboard, activity]
-    monkeypatch.setattr(tasks, "EDGE_STREAK_ACTIVATION_POLL_MS", 1)
+    monkeypatch.setattr(edge_streak, "EDGE_STREAK_ACTIVATION_POLL_MS", 1)
 
     activation = tasks._activate_edge_streak(
         activity,
@@ -2502,20 +2502,20 @@ def test_edge_streak_activation_failure_does_not_navigate_dashboard(monkeypatch)
     dashboard.context.pages = [historical, dashboard, activity]
 
     def fail_activation(*_args, **_kwargs):
-        new_page = Page("new", tasks.EDGE_STREAK_LAUNCH_URL)
+        new_page = Page("new", edge_streak.EDGE_STREAK_LAUNCH_URL)
         dashboard.context.pages.append(new_page)
-        return tasks.EdgeStreakActivation(None, (new_page,), False)
+        return edge_streak.EdgeStreakActivation(None, (new_page,), False)
 
-    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: (0, 30))
+    monkeypatch.setattr(edge_streak, "read_streak_progress", lambda *_args: (0, 30))
     monkeypatch.setattr(
-        tasks,
+        edge_streak,
         "_prepare_edge_streak",
-        lambda _page: tasks.EdgeStreakEntry(activity, (activity,), True),
+        lambda _page: edge_streak.EdgeStreakEntry(activity, (activity,), True),
     )
-    monkeypatch.setattr(tasks, "_activate_edge_streak", fail_activation)
+    monkeypatch.setattr(edge_streak, "_activate_edge_streak", fail_activation)
     goto_calls = []
     monkeypatch.setattr(
-        tasks, "safe_goto", lambda target, url, **kwargs: goto_calls.append(target)
+        edge_streak, "safe_goto", lambda target, url, **kwargs: goto_calls.append(target)
     )
 
     assert tasks.do_edge_browsing_streak(dashboard, minutes=1, poll_seconds=60) == 0
@@ -2595,7 +2595,7 @@ def test_prepare_edge_streak_returns_opened_page_when_redirect_times_out(monkeyp
         "https://www.microsoft.com/edge/launch/rewards-browsing-streak1",
         page.context,
     )
-    monkeypatch.setattr(tasks, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 1)
+    monkeypatch.setattr(edge_streak, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 1)
 
     entry = tasks._prepare_edge_streak(page)
 
@@ -2619,7 +2619,7 @@ def test_edge_streak_new_unconfirmed_page_is_cleaned_by_owner():
 
     new_page = Page("new", "https://www.microsoft.com/edge/launch/rewards-browsing-streak1")
 
-    entry = tasks.EdgeStreakEntry(None, (new_page,), True)
+    entry = edge_streak.EdgeStreakEntry(None, (new_page,), True)
 
     assert entry.activity_page is None
     assert entry.created_pages == (new_page,)
@@ -2677,11 +2677,11 @@ def test_edge_streak_reuses_browsing_page_for_progress_15_to_30(monkeypatch):
 
     def fake_prepare(target):
         prepare_calls.append(target)
-        return tasks.EdgeStreakEntry(activity, (activity,), True)
+        return edge_streak.EdgeStreakEntry(activity, (activity,), True)
 
     def fake_activate(*_args, **_kwargs):
         activation_calls.append(True)
-        return tasks.EdgeStreakActivation(activation, (activation,), True)
+        return edge_streak.EdgeStreakActivation(activation, (activation,), True)
 
     def fake_goto(target, _url, **_kwargs):
         if target is dashboard:
@@ -2689,10 +2689,10 @@ def test_edge_streak_reuses_browsing_page_for_progress_15_to_30(monkeypatch):
         assert target is activation
         browsing_targets.append(target)
 
-    monkeypatch.setattr(tasks, "read_streak_progress", fake_read)
-    monkeypatch.setattr(tasks, "_prepare_edge_streak", fake_prepare)
-    monkeypatch.setattr(tasks, "_activate_edge_streak", fake_activate)
-    monkeypatch.setattr(tasks, "safe_goto", fake_goto)
+    monkeypatch.setattr(edge_streak, "read_streak_progress", fake_read)
+    monkeypatch.setattr(edge_streak, "_prepare_edge_streak", fake_prepare)
+    monkeypatch.setattr(edge_streak, "_activate_edge_streak", fake_activate)
+    monkeypatch.setattr(edge_streak, "safe_goto", fake_goto)
 
     assert tasks.do_edge_browsing_streak(dashboard, minutes=20, poll_seconds=60) == 1
     assert prepare_calls == [dashboard]
@@ -2712,20 +2712,20 @@ def test_edge_streak_not_logged_in_does_not_open_or_wait(monkeypatch):
     actions = []
     page = type("Page", (), {"url": "https://rewards.bing.com/dashboard"})()
 
-    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: (0, 30))
-    monkeypatch.setattr(tasks, "edge_browser_profile_logged_in", lambda *_args: False)
+    monkeypatch.setattr(edge_streak, "read_streak_progress", lambda *_args: (0, 30))
+    monkeypatch.setattr(edge_streak, "edge_browser_profile_logged_in", lambda *_args: False)
     monkeypatch.setattr(
-        tasks,
+        edge_streak,
         "_prepare_edge_streak",
-        lambda *_args: actions.append("open") or tasks.EdgeStreakEntry(page, (), False),
+        lambda *_args: actions.append("open") or edge_streak.EdgeStreakEntry(page, (), False),
     )
     monkeypatch.setattr(
-        tasks,
+        edge_streak,
         "_activate_edge_streak",
         lambda *_args, **_kwargs: actions.append("activate"),
     )
     monkeypatch.setattr(
-        tasks, "safe_goto", lambda *_args, **_kwargs: actions.append("navigate")
+        edge_streak, "safe_goto", lambda *_args, **_kwargs: actions.append("navigate")
     )
 
     assert tasks.do_edge_browsing_streak(page, minutes=30, poll_seconds=60) == 0
@@ -2755,21 +2755,21 @@ def test_edge_streak_waits_full_30_minutes_when_logged_in_but_zero(
         return (0, 30)
 
     def fake_goto(_target, url, **_kwargs):
-        if url == tasks.REWARDS_DASHBOARD:
+        if url == edge_streak.REWARDS_DASHBOARD:
             elapsed_marks.append(len(progress_calls))
 
-    monkeypatch.setattr(tasks, "read_streak_progress", fake_read)
+    monkeypatch.setattr(edge_streak, "read_streak_progress", fake_read)
     monkeypatch.setattr(
-        tasks,
+        edge_streak,
         "_prepare_edge_streak",
-        lambda target: tasks.EdgeStreakEntry(target, (), False),
+        lambda target: edge_streak.EdgeStreakEntry(target, (), False),
     )
     monkeypatch.setattr(
-        tasks,
+        edge_streak,
         "_activate_edge_streak",
-        lambda *_args, **_kwargs: tasks.EdgeStreakActivation(page, (), True),
+        lambda *_args, **_kwargs: edge_streak.EdgeStreakActivation(page, (), True),
     )
-    monkeypatch.setattr(tasks, "safe_goto", fake_goto)
+    monkeypatch.setattr(edge_streak, "safe_goto", fake_goto)
 
     assert tasks.do_edge_browsing_streak(page, minutes=30, poll_seconds=60) == 0
     output = capsys.readouterr().out
@@ -2799,19 +2799,19 @@ def test_edge_streak_zero_poll_seconds_does_not_loop(monkeypatch):
 
     page.wait_for_timeout = fake_wait
     progress_values = iter([(0, 30)] + [(0, 30)] * 100)
-    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: next(progress_values))
+    monkeypatch.setattr(edge_streak, "read_streak_progress", lambda *_args: next(progress_values))
     monkeypatch.setattr(
-        tasks,
+        edge_streak,
         "_prepare_edge_streak",
-        lambda target: tasks.EdgeStreakEntry(target, (), False),
+        lambda target: edge_streak.EdgeStreakEntry(target, (), False),
     )
-    activation = tasks.EdgeStreakActivation(page, (), True)
+    activation = edge_streak.EdgeStreakActivation(page, (), True)
     monkeypatch.setattr(
-        tasks,
+        edge_streak,
         "_activate_edge_streak",
         lambda *_args, **_kwargs: activation,
     )
-    monkeypatch.setattr(tasks, "safe_goto", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(edge_streak, "safe_goto", lambda *_args, **_kwargs: None)
 
     assert tasks.do_edge_browsing_streak(page, minutes=1, poll_seconds=0) == 0
     assert waits
@@ -2865,17 +2865,17 @@ def test_edge_streak_cleanup_runs_on_failure(monkeypatch):
     dashboard.context.pages = [historical, dashboard]
     activity.context = dashboard.context
 
-    monkeypatch.setattr(tasks, "read_streak_progress", lambda *_args: (0, 30))
+    monkeypatch.setattr(edge_streak, "read_streak_progress", lambda *_args: (0, 30))
     monkeypatch.setattr(
-        tasks,
+        edge_streak,
         "_prepare_edge_streak",
-        lambda _page: tasks.EdgeStreakEntry(activity, (activity,), True),
+        lambda _page: edge_streak.EdgeStreakEntry(activity, (activity,), True),
     )
 
     def fail(*_args, **_kwargs):
         raise RuntimeError("activation failed")
 
-    monkeypatch.setattr(tasks, "_activate_edge_streak", fail)
+    monkeypatch.setattr(edge_streak, "_activate_edge_streak", fail)
 
     assert tasks.do_edge_browsing_streak(dashboard, minutes=1) == 0
     assert activity.closed is True
@@ -2975,8 +2975,8 @@ def test_prepare_edge_streak_ignores_historical_activity_page(monkeypatch):
             return None
 
     page = Page()
-    monkeypatch.setattr(tasks, "safe_goto", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(tasks, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 1)
+    monkeypatch.setattr(edge_streak, "safe_goto", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(edge_streak, "EDGE_STREAK_REDIRECT_TIMEOUT_MS", 1)
 
     entry = tasks._prepare_edge_streak(page)
 
@@ -2993,12 +2993,12 @@ def test_edge_streak_returns_success_only_at_30_30(monkeypatch):
             return None
         def mouse(self):
             return None
-    monkeypatch.setattr(tasks, "read_streak_progress", lambda page, label: next(values))
+    monkeypatch.setattr(edge_streak, "read_streak_progress", lambda page, label: next(values))
     monkeypatch.setattr(
-        tasks, "_prepare_edge_streak",
-        lambda target: tasks.EdgeStreakEntry(target, (), False),
+        edge_streak, "_prepare_edge_streak",
+        lambda target: edge_streak.EdgeStreakEntry(target, (), False),
     )
-    monkeypatch.setattr(tasks, "safe_goto", lambda *a, **k: None)
+    monkeypatch.setattr(edge_streak, "safe_goto", lambda *a, **k: None)
     assert tasks.do_edge_browsing_streak(Page(), minutes=1, poll_seconds=60) == 0
 
 
@@ -3023,22 +3023,22 @@ def test_edge_streak_does_not_claim_success_before_target(monkeypatch):
         mouse = Mouse()
         def wait_for_timeout(self, *_):
             return None
-    monkeypatch.setattr(tasks, "read_streak_progress", lambda page, label: next(values))
+    monkeypatch.setattr(edge_streak, "read_streak_progress", lambda page, label: next(values))
     monkeypatch.setattr(
-        tasks, "_prepare_edge_streak",
-        lambda target: tasks.EdgeStreakEntry(target, (), False),
+        edge_streak, "_prepare_edge_streak",
+        lambda target: edge_streak.EdgeStreakEntry(target, (), False),
     )
-    monkeypatch.setattr(tasks, "safe_goto", lambda *a, **k: None)
+    monkeypatch.setattr(edge_streak, "safe_goto", lambda *a, **k: None)
     assert tasks.do_edge_browsing_streak(Page(), minutes=1, poll_seconds=60) == 0
 
 
 def test_edge_streak_returns_success_when_already_complete(monkeypatch):
-    monkeypatch.setattr(tasks, "read_streak_progress", lambda page, label: (30, 30))
+    monkeypatch.setattr(edge_streak, "read_streak_progress", lambda page, label: (30, 30))
     assert tasks.do_edge_browsing_streak(object(), minutes=1, poll_seconds=60) == 1
 
 
 def test_mobile_checkin_returns_success_when_already_complete(monkeypatch):
-    monkeypatch.setattr(tasks, "read_streak_progress", lambda page, label: (1, 1))
+    monkeypatch.setattr(edge_streak, "read_streak_progress", lambda page, label: (1, 1))
     assert tasks.do_mobile_app_checkin(object()) == 1
 
 
