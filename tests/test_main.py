@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from utils import account_pipeline, accounts, browser, clients, config, dashboard, edge_streak, tasks, trends
+from utils import account_pipeline, accounts, browser, clients, config, dashboard, edge_streak, rewards_webview, tasks, trends
 from utils.tasks import EdgeStreakResult, EdgeStreakStatus
 
 
@@ -3604,10 +3604,10 @@ def test_mobile_checkin_returns_zero_without_device(monkeypatch):
 
 
 def test_rewards_desktop_state_available_shape(monkeypatch):
-    monkeypatch.setattr(clients, "_rewards_uia", lambda mode="state", expected_email=None: {
+    monkeypatch.setattr(rewards_webview, "_rewards_uia", lambda mode="state", expected_email=None: {
         "available": False, "task_progress": None, "success": False, "output": "",
     })
-    result = clients.rewards_desktop_state()
+    result = rewards_webview.rewards_desktop_state()
     assert result["available"] is False
     assert result["task_progress"] is None
 
@@ -3617,7 +3617,7 @@ def test_rewards_desktop_state_parses_progress_and_uia_ready(monkeypatch):
         monkeypatch,
         "AVAILABLE=1\nDOC=桌面奖励应用每周专属任务 – Microsoft Rewards\nTASK_PROGRESS=3/8\n",
     )
-    result = clients.rewards_desktop_state()
+    result = rewards_webview.rewards_desktop_state()
     assert result["available"] is True
     assert result["task_progress"] == "3/8"
     assert result["uia_ready"] is True
@@ -3633,7 +3633,7 @@ def _fake_rewards_uia_output(
     captured=None,
     side_effect=None,
 ):
-    monkeypatch.setattr(clients, "_rewards_desktop_hwnd", lambda: 123)
+    monkeypatch.setattr(rewards_webview, "_rewards_desktop_hwnd", lambda: 123)
 
     def fake_run(args, **kwargs):
         if captured is not None:
@@ -3654,7 +3654,7 @@ def _fake_rewards_uia_output(
         result.stdout = output
         return result
 
-    monkeypatch.setattr(clients.subprocess, "run", fake_run)
+    monkeypatch.setattr(rewards_webview.subprocess, "run", fake_run)
 
 
 def test_rewards_desktop_home_without_task_is_safe_noop(monkeypatch):
@@ -3666,15 +3666,15 @@ def test_rewards_desktop_home_without_task_is_safe_noop(monkeypatch):
         "TASK_STATE=no_task\n"
         "SUCCESS=0\n",
     )
-    result = clients.rewards_desktop_state()
+    result = rewards_webview.rewards_desktop_state()
     assert result["available"] is True
     assert result["uia_ready"] is True
     assert result["task_state"] == "no_task"
     assert result["error"] is False
 
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
-    assert clients.run_rewards_desktop_task() == 0
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
+    assert rewards_webview.run_rewards_desktop_task() == 0
 
 
 def test_rewards_desktop_home_text_does_not_count_as_task_success(monkeypatch):
@@ -3687,14 +3687,14 @@ def test_rewards_desktop_home_text_does_not_count_as_task_success(monkeypatch):
         "Microsoft Edge 分钟: 30/30\n"
         "SUCCESS=0\n",
     )
-    result = clients.rewards_desktop_state()
+    result = rewards_webview.rewards_desktop_state()
     assert result["task_progress"] is None
     assert result["success"] is False
     assert result["error"] is False
 
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
-    assert clients.run_rewards_desktop_task() == 0
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
+    assert rewards_webview.run_rewards_desktop_task() == 0
 
 
 def test_rewards_desktop_missing_root_web_area_is_uia_unavailable(monkeypatch):
@@ -3706,15 +3706,15 @@ def test_rewards_desktop_missing_root_web_area_is_uia_unavailable(monkeypatch):
         "TASK_STATE=uia_unavailable\n"
         "ERROR=RootWebArea not found\n",
     )
-    result = clients.rewards_desktop_state()
+    result = rewards_webview.rewards_desktop_state()
     assert result["available"] is True
     assert result["uia_ready"] is False
     assert result["task_state"] == "uia_unavailable"
     assert result["error"] is True
 
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
-    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_UIA_UNAVAILABLE
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
+    assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_UIA_UNAVAILABLE
 
 
 def test_rewards_desktop_run_returns_success_after_task_progress_growth(monkeypatch):
@@ -3728,22 +3728,22 @@ def test_rewards_desktop_run_returns_success_after_task_progress_growth(monkeypa
         "TASK_AFTER=2/3\n"
         "SUCCESS=1\n",
     )
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
-    assert clients.run_rewards_desktop_task() == 1
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
+    assert rewards_webview.run_rewards_desktop_task() == 1
 
 
 def test_rewards_desktop_run_does_not_claim_success_without_growth(monkeypatch):
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
-    monkeypatch.setattr(clients, "_rewards_uia", lambda mode="run": {
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "_rewards_uia", lambda mode="run": {
         "available": True,
         "task_progress": "3/8",
         "success": False,
         "uia_ready": True,
         "output": "",
     })
-    assert clients.run_rewards_desktop_task() == 0
+    assert rewards_webview.run_rewards_desktop_task() == 0
 
 
 def test_rewards_desktop_parses_mouse_fallback_and_progress_growth(monkeypatch):
@@ -3761,7 +3761,7 @@ def test_rewards_desktop_parses_mouse_fallback_and_progress_growth(monkeypatch):
         "TASK_AFTER=3/8\n"
         "SUCCESS=1\n",
     )
-    result = clients.rewards_desktop_state()
+    result = rewards_webview.rewards_desktop_state()
     assert result["task_before"] == "2/8"
     assert result["task_after"] == "3/8"
     assert result["task_progress"] == "3/8"
@@ -3771,9 +3771,9 @@ def test_rewards_desktop_parses_mouse_fallback_and_progress_growth(monkeypatch):
     assert result["invoke_fallback"] == "mouse"
     assert result["success"] is True
 
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
-    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_TASK_GROWN
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
+    assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_TASK_GROWN
 
 
 def test_rewards_desktop_mouse_fallback_failure_remains_error(monkeypatch):
@@ -3792,14 +3792,14 @@ def test_rewards_desktop_mouse_fallback_failure_remains_error(monkeypatch):
         "TASK_ERROR=weekly_item_not_invokable\n"
         "SUCCESS=0\n",
     )
-    result = clients.rewards_desktop_state()
+    result = rewards_webview.rewards_desktop_state()
     assert result["task_state"] == "error"
     assert result["error"] is True
     assert result["success"] is False
 
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
-    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
+    assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_ERROR
 
 
 def test_rewards_desktop_rejects_non_hyperlink_task_item(monkeypatch):
@@ -3815,20 +3815,20 @@ def test_rewards_desktop_rejects_non_hyperlink_task_item(monkeypatch):
         "TASK_AFTER=3/8\n"
         "SUCCESS=1\n",
     )
-    result = clients.rewards_desktop_state()
+    result = rewards_webview.rewards_desktop_state()
     assert result["task_state"] == "error"
     assert result["error"] is True
     assert result["success"] is False
 
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
-    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
+    assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_ERROR
 
 
 def test_rewards_desktop_run_reports_uia_environment_unavailable(monkeypatch):
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
-    monkeypatch.setattr(clients, "_rewards_uia", lambda mode="run": {
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "_rewards_uia", lambda mode="run": {
         "available": True,
         "task_progress": None,
         "success": False,
@@ -3836,7 +3836,7 @@ def test_rewards_desktop_run_reports_uia_environment_unavailable(monkeypatch):
         "uia_unavailable": True,
         "output": "AVAILABLE=1\nUIA_READY=0\n",
     })
-    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_UIA_UNAVAILABLE
+    assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_UIA_UNAVAILABLE
 
 
 def test_rewards_desktop_timeout_is_task_error_not_uia_unavailable(monkeypatch):
@@ -3846,13 +3846,13 @@ def test_rewards_desktop_timeout_is_task_error_not_uia_unavailable(monkeypatch):
         write_result=False,
         side_effect=subprocess.TimeoutExpired(cmd="powershell.exe", timeout=90),
     )
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
 
-    result = clients.rewards_desktop_state()
+    result = rewards_webview.rewards_desktop_state()
     assert result["protocol_error"] is True
     assert result["uia_unavailable"] is False
-    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+    assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_ERROR
 
 
 def test_rewards_desktop_oserror_is_task_error_not_uia_unavailable(monkeypatch):
@@ -3862,13 +3862,13 @@ def test_rewards_desktop_oserror_is_task_error_not_uia_unavailable(monkeypatch):
         write_result=False,
         side_effect=OSError("cannot launch powershell"),
     )
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
 
-    result = clients.rewards_desktop_state()
+    result = rewards_webview.rewards_desktop_state()
     assert result["protocol_error"] is True
     assert result["uia_unavailable"] is False
-    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+    assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_ERROR
 
 
 @pytest.mark.parametrize(
@@ -3880,19 +3880,19 @@ def test_rewards_desktop_oserror_is_task_error_not_uia_unavailable(monkeypatch):
 )
 def test_rewards_desktop_explicit_uia_unavailable_still_skips(monkeypatch, output):
     _fake_rewards_uia_output(monkeypatch, output)
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
 
-    result = clients.rewards_desktop_state()
+    result = rewards_webview.rewards_desktop_state()
     assert result["uia_unavailable"] is True
     assert result["protocol_error"] is False
-    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_UIA_UNAVAILABLE
+    assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_UIA_UNAVAILABLE
 
 
 def test_rewards_desktop_run_reports_actual_task_error(monkeypatch):
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
-    monkeypatch.setattr(clients, "_rewards_uia", lambda mode="run": {
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "_rewards_uia", lambda mode="run": {
         "available": True,
         "task_progress": None,
         "success": False,
@@ -3901,20 +3901,20 @@ def test_rewards_desktop_run_reports_actual_task_error(monkeypatch):
         "error": True,
         "output": "TASK_ERROR=click failed",
     })
-    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+    assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_ERROR
 
 
 def test_rewards_desktop_run_returns_success_after_progress_growth(monkeypatch):
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
-    monkeypatch.setattr(clients, "_rewards_uia", lambda mode="run": {
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "_rewards_uia", lambda mode="run": {
         "available": True,
         "task_progress": "4/8",
         "success": True,
         "uia_ready": True,
         "output": "",
     })
-    assert clients.run_rewards_desktop_task() == 1
+    assert rewards_webview.run_rewards_desktop_task() == 1
 
 
 def test_rewards_desktop_identity_mismatch_blocks_task_click(monkeypatch):
@@ -3929,11 +3929,11 @@ def test_rewards_desktop_identity_mismatch_blocks_task_click(monkeypatch):
         "SUCCESS=0\n",
         captured=calls,
     )
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
 
-    assert clients.run_rewards_desktop_task("target@example.invalid") == (
-        clients.REWARDS_DESKTOP_IDENTITY_MISMATCH
+    assert rewards_webview.run_rewards_desktop_task("target@example.invalid") == (
+        rewards_webview.REWARDS_DESKTOP_IDENTITY_MISMATCH
     )
     assert "-ExpectedEmail" in calls[0]
     assert "target@example.invalid" in calls[0]
@@ -3951,13 +3951,13 @@ def test_rewards_desktop_identity_unverified_blocks_task_click(monkeypatch):
         "SUCCESS=1\n",
         captured=captured,
     )
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
 
-    state = clients.rewards_desktop_state("target@example.invalid")
+    state = rewards_webview.rewards_desktop_state("target@example.invalid")
     assert state["success"] is False
-    assert clients.run_rewards_desktop_task("target@example.invalid") == (
-        clients.REWARDS_DESKTOP_IDENTITY_UNVERIFIED
+    assert rewards_webview.run_rewards_desktop_task("target@example.invalid") == (
+        rewards_webview.REWARDS_DESKTOP_IDENTITY_UNVERIFIED
     )
     assert "-ExpectedEmail" in captured[0]
 
@@ -3977,11 +3977,11 @@ def test_rewards_desktop_verified_identity_continues_task_flow(monkeypatch):
         "SUCCESS=1\n",
         captured=captured,
     )
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
 
-    assert clients.run_rewards_desktop_task("target@example.invalid") == (
-        clients.REWARDS_DESKTOP_TASK_GROWN
+    assert rewards_webview.run_rewards_desktop_task("target@example.invalid") == (
+        rewards_webview.REWARDS_DESKTOP_TASK_GROWN
     )
     assert "target@example.invalid" in captured[0]
 
@@ -3998,10 +3998,10 @@ def test_rewards_desktop_rejects_run_id_mismatch(monkeypatch):
         "SUCCESS=1\n",
         run_id_override="stale-run-id",
     )
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
 
-    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+    assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_ERROR
 
 
 def test_rewards_desktop_rejects_nonzero_powershell_exit(monkeypatch):
@@ -4014,10 +4014,10 @@ def test_rewards_desktop_rejects_nonzero_powershell_exit(monkeypatch):
         "SUCCESS=1\n",
         returncode=1,
     )
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
 
-    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+    assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_ERROR
 
 
 def test_rewards_desktop_does_not_read_legacy_fixed_result_file(
@@ -4028,16 +4028,16 @@ def test_rewards_desktop_does_not_read_legacy_fixed_result_file(
         "AVAILABLE=1\nTASK_STATE=task\nTASK_AFTER=2/3\nSUCCESS=1\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(clients, "REWARDS_DESKTOP_UIA_RESULT", legacy_result)
+    monkeypatch.setattr(rewards_webview, "REWARDS_DESKTOP_UIA_RESULT", legacy_result)
     _fake_rewards_uia_output(
         monkeypatch,
         "AVAILABLE=1\nUIA_READY=1\nTASK_STATE=error\nERROR=boom\n",
         write_result=False,
     )
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
 
-    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+    assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_ERROR
 
 
 def test_rewards_desktop_task_invoke_failed_is_error(monkeypatch):
@@ -4051,12 +4051,12 @@ def test_rewards_desktop_task_invoke_failed_is_error(monkeypatch):
         "TASK_ERROR=weekly_item_not_invokable\n"
         "SUCCESS=0\n",
     )
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
 
-    result = clients.rewards_desktop_state()
+    result = rewards_webview.rewards_desktop_state()
     assert result["task_state"] == "error"
-    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_ERROR
+    assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_ERROR
 
 
 def test_rewards_desktop_identity_comparison_is_case_insensitive(monkeypatch):
@@ -4070,11 +4070,11 @@ def test_rewards_desktop_identity_comparison_is_case_insensitive(monkeypatch):
         "TASK_STATE=no_task\n"
         "SUCCESS=0\n",
     )
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
 
-    assert clients.run_rewards_desktop_task("target@example.invalid") == (
-        clients.REWARDS_DESKTOP_NO_TASK
+    assert rewards_webview.run_rewards_desktop_task("target@example.invalid") == (
+        rewards_webview.REWARDS_DESKTOP_NO_TASK
     )
 
 
@@ -4088,14 +4088,14 @@ def test_rewards_desktop_task_page_without_task_item_is_failure(monkeypatch):
         "TASK=0\n"
         "SUCCESS=0\n",
     )
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
 
-    result = clients.rewards_desktop_state()
+    result = rewards_webview.rewards_desktop_state()
     assert result["task_state"] == "task_item_missing"
     assert result["error"] is True
-    assert clients.run_rewards_desktop_task() == (
-        clients.REWARDS_DESKTOP_TASK_ITEM_MISSING
+    assert rewards_webview.run_rewards_desktop_task() == (
+        rewards_webview.REWARDS_DESKTOP_TASK_ITEM_MISSING
     )
 
 
@@ -4128,11 +4128,11 @@ def test_rewards_desktop_each_call_uses_and_removes_unique_result_file(monkeypat
         "AVAILABLE=1\nUIA_READY=1\nTASK_STATE=no_task\nSUCCESS=0\n",
         captured=captured,
     )
-    monkeypatch.setattr(clients, "ENABLE_REWARDS_DESKTOP", True)
-    monkeypatch.setattr(clients, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
 
-    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_NO_TASK
-    assert clients.run_rewards_desktop_task() == clients.REWARDS_DESKTOP_NO_TASK
+    assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_NO_TASK
+    assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_NO_TASK
     first = Path(captured[0][captured[0].index("-ResultPath") + 1])
     second = Path(captured[1][captured[1].index("-ResultPath") + 1])
     assert first != second
