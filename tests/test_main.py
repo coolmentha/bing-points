@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from utils import account_pipeline, accounts, browser, clients, config, dashboard, edge_streak, rewards_webview, tasks, trends
+from utils.outcomes import ExitCode, RunSnapshot, exit_code_reason
 from utils.tasks import EdgeStreakResult, EdgeStreakStatus
 
 
@@ -36,6 +37,14 @@ def test_launch_persistent_is_shared_between_browser_and_main():
     assert main_module.launch_persistent is browser.launch_persistent
 
 
+def test_phase4_public_api_is_available_from_main():
+    import main as main_module
+
+    assert main_module.RunSnapshot is RunSnapshot
+    assert main_module.ExitCode is ExitCode
+    assert main_module.exit_code_reason is exit_code_reason
+
+
 def test_account_pipeline_fresh_import_has_no_cycle():
     import sys
 
@@ -57,7 +66,7 @@ def test_account_pipeline_fresh_import_has_no_cycle():
 
 @pytest.fixture(autouse=True)
 def edge_browser_logged_in(tmp_path_factory, monkeypatch):
-    """Edge 打卡行为测试默认使用已登录的临时 profile。"""
+    """Edge 打卡测试默认使用与通用临时目录不同的可持久化 profile。"""
     root = tmp_path_factory.mktemp("synthetic_edge_user_data")
     profile = root / "Default"
     profile.mkdir()
@@ -73,6 +82,7 @@ def edge_browser_logged_in(tmp_path_factory, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setattr(edge_streak, "edge_user_data_dir", root)
+    monkeypatch.setattr(account_pipeline, "EDGE_USER_DATA_DIR", root)
 
 
 # ======================== 账号管理 ========================
@@ -540,6 +550,123 @@ def test_do_daily_offer_tasks_stops_before_opening_card_on_risk(monkeypatch):
         tasks.do_daily_offer_tasks(RiskPage())
 
 
+@pytest.mark.parametrize(
+    ("kind", "href", "title"),
+    [
+        ("search", "https://www.bing.com/search?q=today&amp;form=ML2BF1", "今日问答"),
+        (
+            "puzzle",
+            "https://www.bing.com/spotlight/imagepuzzle?form=ML2BF0",
+            "完成此拼图",
+        ),
+    ],
+)
+def test_do_daily_offer_tasks_search_and_puzzle_do_not_raise_name_error(
+    monkeypatch, kind, href, title
+):
+    panel = (
+        '<button aria-label="日常任务" slot="trigger"></button>'
+        '<div class="react-aria-DisclosurePanel">'
+        f'<a href="{href}" target="_blank"><img alt="{title}"><p>{title}</p></a>'
+        "</div>"
+    )
+
+    class Page:
+        url = "https://rewards.bing.com/earn"
+
+        def content(self):
+            return panel
+
+        def wait_for_load_state(self, *_args, **_kwargs):
+            return None
+
+        def wait_for_timeout(self, *_args):
+            return None
+
+    monkeypatch.setattr(tasks, "safe_goto", lambda *_a, **_k: None)
+    monkeypatch.setattr(tasks, "detect_risk_control", lambda _page: None)
+    monkeypatch.setattr(tasks, "_open_task_card", lambda page, _title: page)
+    monkeypatch.setattr(tasks, "complete_image_puzzle", lambda _page: True)
+    monkeypatch.setattr(tasks, "_random_scroll", lambda _page: None)
+    monkeypatch.setattr(tasks, "random_sleep", lambda *_a, **_k: None)
+
+    assert tasks.do_daily_offer_tasks(Page()) == 1
+
+
+def test_do_daily_offer_tasks_propagates_name_error(monkeypatch):
+    panel = (
+        '<button aria-label="日常任务" slot="trigger"></button>'
+        '<div class="react-aria-DisclosurePanel">'
+        '<a href="https://www.bing.com/search?q=today&amp;form=ML2BF1" '
+        'target="_blank"><img alt="今日问答"><p>今日问答</p></a>'
+        "</div>"
+    )
+
+    class Page:
+        url = "https://rewards.bing.com/earn"
+
+        def content(self):
+            return panel
+
+        def wait_for_load_state(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(tasks, "safe_goto", lambda *_a, **_k: None)
+    monkeypatch.setattr(tasks, "detect_risk_control", lambda _page: None)
+    monkeypatch.setattr(tasks, "_open_task_card", lambda page, _title: page)
+
+    def broken_app_only(_page):
+        raise NameError("_is_app_only_page is not defined")
+
+    monkeypatch.setattr(tasks, "_is_app_only_page", broken_app_only)
+
+    with pytest.raises(NameError, match="_is_app_only_page"):
+        tasks.do_daily_offer_tasks(Page())
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("<div>积分商城专享任务</div>", True),
+        ("<div>仅限 Microsoft Rewards 应用完成</div>", True),
+        ("<div>普通网页任务</div>", False),
+        ("<div>仅限网页完成</div>", False),
+    ],
+)
+def test_is_app_only_page_matches_expected_content(content, expected):
+    class Page:
+        def content(self):
+            return content
+
+    assert tasks._is_app_only_page(Page()) is expected
+
+
+def test_is_app_only_page_runtime_error_returns_false():
+    class Page:
+        def content(self):
+            raise RuntimeError("page closed")
+
+    assert tasks._is_app_only_page(Page()) is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        NameError("_is_app_only_page is not defined"),
+        AttributeError("page.content is not callable"),
+        TypeError("content returned non-string"),
+        AssertionError("unexpected page state"),
+    ],
+)
+def test_is_app_only_page_programming_errors_propagate(error):
+    class Page:
+        def content(self):
+            raise error
+
+    with pytest.raises(type(error), match=str(error)):
+        tasks._is_app_only_page(Page())
+
+
 def test_detect_risk_control_ignores_news_text_about_verification_codes():
     """真实事故：搜索“芒果TV崩了”时，新闻正文含“收不到验证码”不应触发微软风控。"""
     page = FakePage(
@@ -933,7 +1060,7 @@ def _stub_main_run_for_notifications(
     return main_module
 
 
-def test_failure_notification_is_sent_before_single_instance_guard_close(monkeypatch):
+def test_failure_notification_is_sent_after_single_instance_guard_close(monkeypatch):
     events = []
 
     class Guard:
@@ -952,7 +1079,7 @@ def test_failure_notification_is_sent_before_single_instance_guard_close(monkeyp
     )
 
     assert main_module.main() == 3
-    assert events == ["notify", "guard.close"]
+    assert events == ["guard.close", "notify"]
 
 
 def test_main_sends_failure_notification_once(monkeypatch):
@@ -964,7 +1091,7 @@ def test_main_sends_failure_notification_once(monkeypatch):
 
     assert main_module.main() == 3
     assert len(calls) == 1
-    assert calls[0][0] == 3
+    assert calls[0][0].exit_code == 3
 
 
 def test_main_partial_account_failure_returns_six_and_notifies_once(monkeypatch):
@@ -980,7 +1107,48 @@ def test_main_partial_account_failure_returns_six_and_notifies_once(monkeypatch)
 
     assert main_module.main() == 6
     assert len(calls) == 1
-    assert calls[0][0] == 6
+    assert calls[0][0].exit_code == 6
+
+
+def test_python_run_end_marker_is_written_before_guard_release(monkeypatch, tmp_path):
+    events = []
+    log_path = tmp_path / "run_phase4.log"
+    log_path.write_text("run started" + chr(10), encoding="utf-8")
+    monkeypatch.setenv("BING_REWARDS_LOG_FILE", str(log_path))
+
+    class Guard:
+        def close(self):
+            events.append(("guard.close", log_path.read_text(encoding="utf-8")))
+
+    main_module = _stub_main_run_for_notifications(
+        monkeypatch, allow_multi=False, guard=Guard()
+    )
+    from utils import notify
+
+    def notify_now(snapshot):
+        events.append(("notify", log_path.read_text(encoding="utf-8")))
+        assert isinstance(snapshot, RunSnapshot)
+        return True
+
+    monkeypatch.setattr(notify, "notify_failure", notify_now)
+
+    assert main_module.main() == 3
+    assert [event[0] for event in events] == ["guard.close", "notify"]
+    assert events[0][1].count("BingPoints run end exit=3") == 1
+    assert "BingPoints run end exit=3" in events[1][1]
+
+
+def test_main_already_running_returns_seven_without_notification(monkeypatch):
+    main_module = _stub_main_run_for_notifications(
+        monkeypatch, allow_multi=False, guard=None
+    )
+    from utils import notify
+
+    calls = []
+    monkeypatch.setattr(notify, "notify_failure", lambda *a, **k: calls.append(a) or True)
+
+    assert main_module.main() == 7
+    assert calls == []
 
 
 def test_main_does_not_send_notification_on_success(monkeypatch):
@@ -992,6 +1160,29 @@ def test_main_does_not_send_notification_on_success(monkeypatch):
 
     assert main_module.main() == 0
     assert calls == []
+
+
+def test_guard_close_exception_preserves_exit_code_and_still_notifies(monkeypatch):
+    events = []
+
+    class Guard:
+        def close(self):
+            events.append("guard.close.error")
+            raise OSError("socket close failed")
+
+    main_module = _stub_main_run_for_notifications(
+        monkeypatch, allow_multi=False, guard=Guard()
+    )
+    from utils import notify
+
+    monkeypatch.setattr(
+        notify,
+        "notify_failure",
+        lambda *a, **k: events.append("notify") or True,
+    )
+
+    assert main_module.main() == 3
+    assert events == ["guard.close.error", "notify"]
 
 
 def test_main_notification_exception_preserves_exit_code_and_releases_guard(monkeypatch):
@@ -1013,7 +1204,7 @@ def test_main_notification_exception_preserves_exit_code_and_releases_guard(monk
     monkeypatch.setattr(notify, "notify_failure", boom)
 
     assert main_module.main() == 3
-    assert events == ["notify.boom", "guard.close"]
+    assert events == ["guard.close", "notify.boom"]
 
 
 def test_main_notifies_on_early_account_read_failure_without_guard(monkeypatch):
@@ -1029,7 +1220,7 @@ def test_main_notifies_on_early_account_read_failure_without_guard(monkeypatch):
 
     assert main_module.main() == 4
     assert len(calls) == 1
-    assert calls[0][0] == 4
+    assert calls[0][0].exit_code == 4
 
 
 def test_direct_run_early_failure_still_notifies(monkeypatch):
@@ -1045,8 +1236,9 @@ def test_direct_run_early_failure_still_notifies(monkeypatch):
 
     assert main_module._run() == 4
     assert len(calls) == 1
-    assert calls[0][0] == 4
-    assert isinstance(calls[0][1], notify.RunLog)
+    snapshot = calls[0][0]
+    assert isinstance(snapshot, RunSnapshot)
+    assert snapshot.exit_code == 4
 
 
 @pytest.mark.parametrize("exit_code", [2, 3, 4, 5])
@@ -1072,21 +1264,20 @@ def test_each_failure_exit_code_notifies_exactly_once(monkeypatch, exit_code):
 
     assert main_module.main() == exit_code
     assert len(calls) == 1
-    assert calls[0][0] == exit_code
+    assert calls[0][0].exit_code == exit_code
 
 
 def test_failure_body_contains_run_identity_and_no_smtp_secret(monkeypatch, tmp_path):
     from utils import notify
 
     log_path = tmp_path / "run_current.log"
-    run_log = notify.RunLog(
-        "本次日志内容",
-        run_info={
-            "pid": 4321,
-            "log_path": str(log_path),
-            "started_at": "2026-11-08 19:58:38",
-            "log_mtime": "2026-11-08 20:05:00",
-        },
+    run_log = RunSnapshot(
+        pid=4321,
+        log_path=str(log_path),
+        started_at=datetime(2026, 11, 8, 19, 58, 38),
+        finished_at=datetime(2026, 11, 8, 20, 5, 0),
+        exit_code=3,
+        log_text="本次日志内容",
     )
     sent = {}
     monkeypatch.setattr(
@@ -1104,7 +1295,7 @@ def test_failure_body_contains_run_identity_and_no_smtp_secret(monkeypatch, tmp_
     )
     monkeypatch.setattr(notify, "send_mail", lambda cfg, s, b, **k: sent.update(body=b))
 
-    assert notify.notify_failure(3, run_log) is True
+    assert notify.notify_failure(run_log) is True
     body = sent["body"]
     assert "本次运行 PID：4321" in body
     assert f"本次运行日志：{log_path}" in body
@@ -1134,8 +1325,8 @@ def test_notification_log_tail_uses_this_run_log_not_newer_log(monkeypatch, tmp_
 
     assert main_module.main() == 3
     assert len(calls) == 1
-    run_log = calls[0][1]
-    body = notify.build_body(calls[0][0], run_log)
+    run_log = calls[0][0]
+    body = notify.build_body(run_log)
     assert f"本次运行日志：{current_log}" in body
     assert "CURRENT RUN ONLY" in body
     assert "NEW INSTANCE LOG" not in body
@@ -3273,9 +3464,9 @@ def test_run_account_fails_when_daily_activities_incomplete(monkeypatch, capsys)
     ("status_name", "completed"),
     [
         ("NO_KEYWORDS", 0),
-        ("SCORE_STALLED", 2),
-        ("INTERRUPTED", 1),
-        ("COMPLETED", 2),
+        ("SCORE_STALLED", 8),
+        ("INTERRUPTED", 8),
+        ("COMPLETED", 8),
     ],
 )
 def test_run_account_fails_when_pc_search_not_completed(
@@ -3293,11 +3484,33 @@ def test_run_account_fails_when_pc_search_not_completed(
         },
         search_status_name=status_name,
         search_completed=completed,
+        requested_searches=20,
     )
 
     assert result is False
     assert "PC 搜索未完成" in capsys.readouterr().out
     assert calls["search"] == 1
+
+
+def test_run_account_fails_when_pc_search_score_stalled(monkeypatch, capsys):
+    result, calls = _run_account_with_dashboard_checks(
+        monkeypatch,
+        final_dashboard={
+            "claimable_points": 0,
+            "daily_set_items": [],
+            "daily_activities_done": 3,
+            "daily_activities_total": 3,
+            "pc_search_done": 0,
+            "pc_search_total": 0,
+        },
+        search_status_name="SCORE_STALLED",
+        search_completed=8,
+        requested_searches=20,
+    )
+
+    assert result is False
+    assert calls["search"] == 1
+    assert "PC 搜索未完成" in capsys.readouterr().out
 
 
 def test_run_account_continues_when_required_daily_tasks_and_search_complete(monkeypatch):
@@ -3834,9 +4047,71 @@ def test_rewards_desktop_run_reports_uia_environment_unavailable(monkeypatch):
         "success": False,
         "uia_ready": False,
         "uia_unavailable": True,
+        "task_state": "uia_unavailable",
+        "identity_state": "identity_unverified",
         "output": "AVAILABLE=1\nUIA_READY=0\n",
     })
     assert rewards_webview.run_rewards_desktop_task() == rewards_webview.REWARDS_DESKTOP_UIA_UNAVAILABLE
+
+
+def test_rewards_desktop_identity_mismatch_wins_over_uia_unavailable(monkeypatch):
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(
+        rewards_webview,
+        "_rewards_uia",
+        lambda mode="run", expected_email=None: {
+            "available": True,
+            "uia_ready": False,
+            "uia_unavailable": True,
+            "task_state": "uia_unavailable",
+            "identity_state": "identity_mismatch",
+        },
+    )
+
+    assert rewards_webview.run_rewards_desktop_task("target@example.invalid") == (
+        rewards_webview.REWARDS_DESKTOP_IDENTITY_MISMATCH
+    )
+
+
+def test_rewards_desktop_task_state_uia_unavailable_alone_is_environment_unavailable(
+    monkeypatch,
+):
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(
+        rewards_webview,
+        "_rewards_uia",
+        lambda mode="run", expected_email=None: {
+            "available": True,
+            "uia_ready": False,
+            "uia_unavailable": False,
+            "task_state": "uia_unavailable",
+        },
+    )
+
+    assert rewards_webview.run_rewards_desktop_task("target@example.invalid") == (
+        rewards_webview.REWARDS_DESKTOP_UIA_UNAVAILABLE
+    )
+
+
+def test_rewards_desktop_identity_unverified_wins_when_uia_ready(monkeypatch):
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(rewards_webview, "rewards_desktop_available", lambda: True)
+    monkeypatch.setattr(
+        rewards_webview,
+        "_rewards_uia",
+        lambda mode="run", expected_email=None: {
+            "available": True,
+            "uia_ready": True,
+            "uia_unavailable": False,
+            "identity_state": "identity_unverified",
+        },
+    )
+
+    assert rewards_webview.run_rewards_desktop_task("target@example.invalid") == (
+        rewards_webview.REWARDS_DESKTOP_IDENTITY_UNVERIFIED
+    )
 
 
 def test_rewards_desktop_timeout_is_task_error_not_uia_unavailable(monkeypatch):
@@ -3875,7 +4150,11 @@ def test_rewards_desktop_oserror_is_task_error_not_uia_unavailable(monkeypatch):
     "output",
     [
         "AVAILABLE=0\nERROR=NO_PROCESS\n",
-        "AVAILABLE=1\nUIA_READY=0\nTASK_STATE=uia_unavailable\nERROR=RootWebArea not found\n",
+        "AVAILABLE=1\n"
+        "UIA_READY=0\n"
+        "TASK_STATE=uia_unavailable\n"
+        "ERROR=RootWebArea not found\n"
+        "IDENTITY_STATE=identity_unverified\n",
     ],
 )
 def test_rewards_desktop_explicit_uia_unavailable_still_skips(monkeypatch, output):

@@ -1,4 +1,5 @@
-"""阶段 0：运行结果领域模型的纯状态测试。"""
+"""运行结果领域模型的纯状态测试。"""
+from dataclasses import FrozenInstanceError
 from datetime import datetime
 
 import pytest
@@ -7,9 +8,11 @@ from utils.outcomes import (
     AccountOutcome,
     ExitCode,
     RunResult,
+    RunSnapshot,
     RunStatus,
     TaskOutcome,
     TaskStatus,
+    exit_code_reason,
     summarize_accounts,
     task_result,
 )
@@ -189,3 +192,41 @@ def test_exit_code_values_are_stable():
     assert ExitCode.RISK_CONTROL == 5
     assert ExitCode.PARTIAL_FAILURE == 6
     assert ExitCode.ALREADY_RUNNING == 7
+
+
+def test_exit_code_reason_covers_all_stable_codes():
+    expected = {
+        ExitCode.SUCCESS: "运行成功",
+        ExitCode.INTERNAL_ERROR: "内部错误（未预期异常）",
+        ExitCode.STARTUP_FAILED: "启动失败（浏览器 profile 被占用 / 临时目录不可写 / 会话0拿不到窗口站）",
+        ExitCode.ALL_ACCOUNTS_FAILED: "全部账号处理失败（通常是登录态失效或网络问题）",
+        ExitCode.ACCOUNT_CONFIG_FAILED: "读取账号配置失败（accounts.txt 缺失或格式错误）",
+        ExitCode.RISK_CONTROL: "检测到微软验证页面或验证码，已停止运行",
+        ExitCode.PARTIAL_FAILURE: "部分账号处理失败（至少一个账号成功、至少一个失败）",
+        ExitCode.ALREADY_RUNNING: "已有另一个实例在运行，本次已安全让位",
+    }
+
+    for code, reason in expected.items():
+        assert exit_code_reason(code) == reason
+        assert exit_code_reason(int(code)) == reason
+
+
+def test_exit_code_reason_handles_unknown_code():
+    assert exit_code_reason(99) == "未知错误（退出码 99）"
+
+
+def test_run_snapshot_is_immutable_and_keeps_run_identity():
+    snapshot = RunSnapshot(
+        pid=4321,
+        log_path="logs/run_test.log",
+        started_at=datetime(2026, 11, 8, 20, 0, 0),
+        finished_at=datetime(2026, 11, 8, 20, 30, 0),
+        exit_code=ExitCode.ALL_ACCOUNTS_FAILED,
+        log_text="final log tail",
+    )
+
+    assert snapshot.pid == 4321
+    assert snapshot.log_path == "logs/run_test.log"
+    assert snapshot.log_text == "final log tail"
+    with pytest.raises(FrozenInstanceError):
+        snapshot.log_text = "mutated"

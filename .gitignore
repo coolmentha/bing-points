@@ -4,6 +4,7 @@ accounts.txt
 __pycache__/
 tests/__pycache__/
 tmp_playwright_profile/
+tmp_playwright_profile_edge/
 tmp_playwright_profile_mobile/
 tmp_playwright_temp/
 logs/

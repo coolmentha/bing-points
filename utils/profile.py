@@ -526,7 +526,12 @@ def main(argv=None) -> int:
     """命令行入口：python -m utils.profile [--check|--kill]"""
     import argparse
 
-    from utils.config import MOBILE_PROFILE_DIR, USER_DATA_DIR
+    from utils.config import (
+        DEDICATED_EDGE_USER_DATA_DIR,
+        EDGE_USER_DATA_DIR,
+        MOBILE_PROFILE_DIR,
+        USER_DATA_DIR,
+    )
 
     parser = argparse.ArgumentParser(description="检查/清理 bing-points 使用的浏览器 profile 占用")
     group = parser.add_mutually_exclusive_group()
@@ -535,7 +540,12 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     exit_code = 0
-    for label, directory in (("桌面", USER_DATA_DIR), ("移动端", MOBILE_PROFILE_DIR)):
+    profiles = (
+        ("桌面", EDGE_USER_DATA_DIR),
+        ("旧版临时", USER_DATA_DIR),
+        ("移动端", MOBILE_PROFILE_DIR),
+    )
+    for label, directory in profiles:
         path = Path(directory)
         if not path.exists():
             print(f"[{label}] profile 目录不存在（未使用过）: {path}")
@@ -553,6 +563,15 @@ def main(argv=None) -> int:
                 print(f"  pid={pid} {command[:160]}")
 
         if args.kill and in_use:
+            # 只允许清理项目自有目录；显式指向日常 Edge User Data 时绝不动用户进程。
+            project_owned = path.resolve() in (
+                Path(DEDICATED_EDGE_USER_DATA_DIR).resolve(),
+                Path(USER_DATA_DIR).resolve(),
+            )
+            if not project_owned:
+                print("  跳过清理: 这是外部 profile，--kill 只处理项目自有目录")
+                exit_code = 1
+                continue
             killed = kill_profile_holders(path)
             print(f"  已结束 {len(killed)} 个进程")
             if is_profile_in_use(path):

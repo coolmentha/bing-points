@@ -377,17 +377,22 @@ def _run_account_outcome(
                 and search_outcome.status is SearchStatus.COMPLETED
                 and search_outcome.completed >= DEFAULT_PC_SEARCHES
             )
+            status = getattr(search_outcome, "status", None)
+            completed = getattr(search_outcome, "completed", "unknown")
             if not search_ok:
-                status = getattr(search_outcome, "status", "unknown")
-                completed = getattr(search_outcome, "completed", "unknown")
+                if status is SearchStatus.SCORE_STALLED:
+                    detail = "积分连续无增长，无法确认搜索是否已封顶，按未完成处理"
+                else:
+                    detail = f"状态={status or 'unknown'}, 实际 {completed}/{DEFAULT_PC_SEARCHES} 次"
                 print(
-                    f"  PC 搜索未完成: 状态={status}, "
+                    f"  PC 搜索未完成: 状态={status or 'unknown'}, "
                     f"实际 {completed}/{DEFAULT_PC_SEARCHES} 次"
                 )
                 _record(
                     "pc_search",
                     TaskStatus.FAILED,
-                    detail=f"状态={status}, 实际 {completed}/{DEFAULT_PC_SEARCHES} 次",
+                    required=True,
+                    detail=detail,
                     after=completed,
                 )
             else:
@@ -462,7 +467,7 @@ def _run_account_outcome(
                 )
                 return _finish()
         else:
-            print("  当前为隔离 profile，跳过 Edge 30 分钟任务（需正式 Edge profile）")
+            print("  当前为临时隔离 profile，跳过 Edge 30 分钟任务")
             _record("edge", TaskStatus.SKIPPED, required=False)
 
         print("\n  --- 必应应用签到（Android 模拟器） ---")

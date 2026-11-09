@@ -1,13 +1,16 @@
 import os
 import smtplib
 import socket
+import subprocess
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from utils import config, profile
+from utils.outcomes import ExitCode
 
 import main as main_module
 
@@ -349,23 +352,41 @@ def test_create_context_exits_with_temp_hint(monkeypatch):
 # ======================== 命令行入口 ========================
 
 def test_cli_check_reports_free_profiles(monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(config, "USER_DATA_DIR", tmp_path / "pc")
+    monkeypatch.setattr(config, "USER_DATA_DIR", tmp_path / "legacy")
+    monkeypatch.setattr(config, "EDGE_USER_DATA_DIR", tmp_path / "dedicated")
+    monkeypatch.setattr(config, "DEDICATED_EDGE_USER_DATA_DIR", tmp_path / "dedicated")
     monkeypatch.setattr(config, "MOBILE_PROFILE_DIR", tmp_path / "mobile")
-    (tmp_path / "pc").mkdir()
+    (tmp_path / "dedicated").mkdir()
     assert profile.main(["--check"]) == 0
     out = capsys.readouterr().out
     assert "占用状态: 空闲" in out
     assert "profile 目录不存在" in out
 
 
+def test_cli_kill_never_touches_external_edge_profile(monkeypatch, tmp_path, capsys):
+    external = tmp_path / "real-edge"
+    external.mkdir()
+    monkeypatch.setattr(config, "USER_DATA_DIR", tmp_path / "legacy")
+    monkeypatch.setattr(config, "EDGE_USER_DATA_DIR", external)
+    monkeypatch.setattr(config, "DEDICATED_EDGE_USER_DATA_DIR", tmp_path / "dedicated")
+    monkeypatch.setattr(config, "MOBILE_PROFILE_DIR", tmp_path / "mobile")
+    monkeypatch.setattr(profile, "is_profile_in_use", lambda path: Path(path) == external)
+    kills = []
+    monkeypatch.setattr(profile, "kill_profile_holders", lambda path: kills.append(path) or [])
+
+    assert profile.main(["--kill"]) == 1
+    assert kills == []
+    assert "跳过清理" in capsys.readouterr().out
+
+
 # ======================== main.py 启动逻辑 ========================
 
 @pytest.fixture(autouse=True)
 def _legacy_tests_use_isolated_profile(monkeypatch, request):
-    """旧启动重试测试只验证隔离 profile。
+    """旧启动重试测试只验证通用隔离 profile。
 
-    正式 profile 现在走正常 Edge + CDP，单独由 CDP 测试覆盖；这里显式把
-    EDGE_USER_DATA_DIR 指向隔离目录，避免环境相关配置改变测试分支。
+    可持久化专用 profile 走正常 Edge + CDP，单独由 CDP 测试覆盖；这里显式把
+    EDGE_USER_DATA_DIR 指向通用隔离目录，避免环境相关配置改变测试分支。
     """
     if request.node.name.startswith(("test_real_edge", "test_create_context_requires_cdp")):
         return
@@ -640,12 +661,290 @@ def test_main_returns_four_when_accounts_unreadable(monkeypatch, _stub_main_deps
     assert main_module.main() == 4
 
 
-def test_main_returns_zero_when_another_instance_running(monkeypatch, _stub_main_deps):
+def test_main_returns_seven_when_another_instance_running(
+    monkeypatch, _stub_main_deps
+):
     monkeypatch.delenv("BING_REWARDS_ALLOW_MULTI", raising=False)
     monkeypatch.setattr(main_module.profile, "acquire_single_instance", lambda **k: None)
     monkeypatch.setattr(main_module.sys, "argv", ["main.py"])
-    # 并发实例属于“正常让位”，不该让计划任务报失败
-    assert main_module.main() == 0
+
+    from utils import notify
+
+    calls = []
+    monkeypatch.setattr(
+        notify, "notify_failure", lambda *a, **k: calls.append(a) or True
+    )
+
+    # 并发让位是一个独立生命周期，不是业务失败，也不发送失败通知。
+    assert main_module.main() == 7
+    assert calls == []
+
+
+def test_default_edge_profile_resolver_is_not_affected_by_ambient_env(
+    monkeypatch, tmp_path
+):
+    """默认解析走纯函数，不依赖真实 .env 或已导入的全局常量。"""
+    monkeypatch.setenv("BING_REWARDS_EDGE_USER_DATA_DIR", str(tmp_path / "ambient"))
+    dedicated = tmp_path / "owned" / "tmp_playwright_profile_edge"
+    resolved = config.resolve_edge_user_data_dir(None, dedicated, {})
+    assert resolved == dedicated.absolute()
+    assert resolved.parent == (tmp_path / "owned").absolute()
+
+
+def test_load_env_preserves_then_expands_known_variables(monkeypatch, tmp_path):
+    env_path = tmp_path / ".env.test"
+    env_path.write_text(
+        "BING_REWARDS_EDGE_USER_DATA_DIR=${LOCALAPPDATA}/Microsoft/Edge/User Data\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("BING_REWARDS_EDGE_USER_DATA_DIR", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local AppData"))
+
+    config.load_env(env_path)
+
+    raw = os.environ["BING_REWARDS_EDGE_USER_DATA_DIR"]
+    assert raw == "${LOCALAPPDATA}/Microsoft/Edge/User Data"
+    assert config.resolve_env_path(raw) == (
+        tmp_path / "Local AppData" / "Microsoft" / "Edge" / "User Data"
+    ).absolute()
+
+
+def test_load_env_rejects_unknown_variable_instead_of_empty_path(monkeypatch, tmp_path):
+    env_path = tmp_path / ".env.test"
+    env_path.write_text(
+        "BING_REWARDS_EDGE_USER_DATA_DIR=${MISSING}/profile\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("BING_REWARDS_EDGE_USER_DATA_DIR", raising=False)
+
+    with pytest.raises(ValueError, match=r"\$\{MISSING\}"):
+        config.load_env(env_path)
+
+
+def test_load_env_prefers_existing_system_value(monkeypatch, tmp_path):
+    env_path = tmp_path / ".env.test"
+    env_path.write_text(
+        "BING_REWARDS_EDGE_USER_DATA_DIR=${MISSING}/profile\n",
+        encoding="utf-8",
+    )
+    expected = str(tmp_path / "system-profile")
+    monkeypatch.setenv("BING_REWARDS_EDGE_USER_DATA_DIR", expected)
+
+    config.load_env(env_path)
+
+    assert os.environ["BING_REWARDS_EDGE_USER_DATA_DIR"] == expected
+
+
+def test_env_path_expands_percent_and_shell_variables(tmp_path):
+    base = tmp_path / "Local AppData"
+    env = {"LOCALAPPDATA": str(base)}
+    for raw in (
+        r"%LOCALAPPDATA%\Microsoft\Edge\User Data",
+        "${LOCALAPPDATA}/Microsoft/Edge/User Data",
+    ):
+        assert config.resolve_env_path(raw, env) == (
+            base / "Microsoft" / "Edge" / "User Data"
+        ).absolute()
+
+
+def test_env_path_rejects_unknown_percent_variable(tmp_path):
+    with pytest.raises(ValueError, match="%MISSING%"):
+        config.resolve_env_path("%MISSING%\\profile", {})
+
+
+def test_env_path_rejects_unknown_shell_variable(tmp_path):
+    with pytest.raises(ValueError, match=r"\$\{MISSING\}"):
+        config.resolve_env_path("${MISSING}/profile", {})
+
+
+def test_env_path_rejects_relative_path(tmp_path):
+    with pytest.raises(ValueError, match="绝对路径"):
+        config.resolve_env_path("relative/profile", {})
+
+
+def test_env_path_expands_variables_from_process_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert config.resolve_env_path(r"%LOCALAPPDATA%\profile") == (
+        tmp_path / "profile"
+    ).absolute()
+
+
+def test_env_path_matches_real_edge_user_data_after_expansion(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    resolved = config.resolve_env_path(
+        r"%LOCALAPPDATA%\Microsoft\Edge\User Data"
+    )
+    expected = tmp_path / "Microsoft" / "Edge" / "User Data"
+    assert resolved == expected
+    assert resolved != config.DEDICATED_EDGE_USER_DATA_DIR
+
+
+def test_uninitialized_dedicated_profile_starts_visible_edge_once_and_fails_fast(
+    monkeypatch, tmp_path
+):
+    dedicated = tmp_path / "tmp_playwright_profile_edge"
+    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", dedicated)
+    monkeypatch.setattr(main_module, "DEDICATED_EDGE_USER_DATA_DIR", dedicated)
+    monkeypatch.setattr(main_module, "DEFAULT_EDGE_USER_DATA_DIR", tmp_path / "real")
+    monkeypatch.setattr(
+        main_module.profile, "find_edge_executable", lambda: Path("D:/edge/msedge.exe")
+    )
+    monkeypatch.setattr(main_module.profile, "ensure_profile_available", lambda *a, **k: True)
+    calls = []
+    monkeypatch.setattr(
+        main_module, "_launch_visible_edge_for_login", lambda path: calls.append(path)
+    )
+
+    def fail_cdp(*_args, **_kwargs):
+        raise AssertionError("未初始化专用 profile 不应连接 CDP")
+
+    monkeypatch.setattr(main_module, "_launch_real_edge_cdp", fail_cdp)
+
+    class FakeChromium:
+        def launch_persistent_context(self, **_kwargs):
+            raise AssertionError("未初始化专用 profile 不应走 Playwright 启动")
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    with pytest.raises(SystemExit) as exc:
+        main_module.create_context(FakePlaywright(), False)
+    assert exc.value.code == 2
+    assert calls == [dedicated]
+
+
+def test_empty_preferences_dedicated_profile_fails_fast(monkeypatch, tmp_path):
+    dedicated = tmp_path / "tmp_playwright_profile_edge"
+    (dedicated / "Default").mkdir(parents=True)
+    (dedicated / "Default" / "Preferences").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", dedicated)
+    monkeypatch.setattr(main_module, "DEDICATED_EDGE_USER_DATA_DIR", dedicated)
+    monkeypatch.setattr(main_module, "DEFAULT_EDGE_USER_DATA_DIR", tmp_path / "real")
+    monkeypatch.setattr(
+        main_module.profile, "find_edge_executable", lambda: Path("D:/edge/msedge.exe")
+    )
+    monkeypatch.setattr(main_module.profile, "ensure_profile_available", lambda *a, **k: True)
+    login_calls = []
+    monkeypatch.setattr(
+        main_module, "_launch_visible_edge_for_login", lambda path: login_calls.append(path)
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_launch_real_edge_cdp",
+        lambda *a, **k: pytest.fail("空 Preferences 不应连接 CDP"),
+    )
+
+    class FakePlaywright:
+        chromium = object()
+
+    with pytest.raises(SystemExit) as exc:
+        main_module.create_context(FakePlaywright(), False)
+    assert exc.value.code == 2
+    assert login_calls == [dedicated]
+
+
+def test_initialized_dedicated_profile_uses_cdp(monkeypatch, tmp_path):
+    import json
+
+    dedicated = tmp_path / "tmp_playwright_profile_edge"
+    (dedicated / "Default").mkdir(parents=True)
+    (dedicated / "Default" / "Preferences").write_text("{}", encoding="utf-8")
+    (dedicated / "Local State").write_text(
+        json.dumps({
+            "profile": {
+                "info_cache": {
+                    "Default": {"user_name": "synthetic@example.invalid"}
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", dedicated)
+    monkeypatch.setattr(main_module, "DEDICATED_EDGE_USER_DATA_DIR", dedicated)
+    monkeypatch.setattr(main_module, "DEFAULT_EDGE_USER_DATA_DIR", tmp_path / "real")
+    monkeypatch.setattr(
+        main_module.profile, "find_edge_executable", lambda: Path("D:/edge/msedge.exe")
+    )
+    monkeypatch.setattr(main_module.profile, "ensure_profile_available", lambda *a, **k: True)
+    cdp_calls = []
+    monkeypatch.setattr(
+        main_module,
+        "_launch_real_edge_cdp",
+        lambda p, path, headless: cdp_calls.append((path, headless)) or "ctx",
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_launch_visible_edge_for_login",
+        lambda path: pytest.fail("已初始化时不应进入首次登录流程"),
+    )
+
+    class FakePlaywright:
+        chromium = object()
+
+    assert main_module.create_context(FakePlaywright(), False) == "ctx"
+    assert cdp_calls == [(dedicated, False)]
+
+
+def test_uninitialized_dedicated_profile_does_not_enter_account_loop(
+    monkeypatch, _stub_main_deps
+):
+    _stub_main_deps["accounts"] = [("u@example.com", "p")]
+    _fake_playwright(monkeypatch)
+    started = []
+
+    def fail_start(*_args, **_kwargs):
+        started.append("edge")
+        raise SystemExit(2)
+
+    monkeypatch.setattr(main_module, "create_context", fail_start)
+    run_calls = []
+    monkeypatch.setattr(
+        main_module,
+        "run_account",
+        lambda *a, **k: run_calls.append(a) or True,
+    )
+    monkeypatch.setattr(main_module.sys, "argv", ["main.py"])
+
+    assert main_module._run() == 2
+    assert started == ["edge"]
+    assert run_calls == []
+
+
+def test_default_edge_profile_uses_cdp_instead_of_playwright_lock(monkeypatch, tmp_path):
+    import json
+
+    dedicated = tmp_path / "tmp_playwright_profile_edge"
+    (dedicated / "Default").mkdir(parents=True)
+    (dedicated / "Default" / "Preferences").write_text("{}", encoding="utf-8")
+    (dedicated / "Local State").write_text(
+        json.dumps({
+            "profile": {
+                "info_cache": {
+                    "Default": {"user_name": "synthetic@example.invalid"}
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    launched = {}
+    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", dedicated)
+    monkeypatch.setattr(main_module, "DEDICATED_EDGE_USER_DATA_DIR", dedicated)
+    monkeypatch.setattr(main_module.profile, "find_edge_executable", lambda: Path("D:/edge/msedge.exe"))
+    monkeypatch.setattr(main_module.profile, "ensure_profile_available", lambda *a, **k: True)
+
+    def fake_cdp(*_args, **_kwargs):
+        launched["cdp"] = True
+        return "ctx"
+
+    monkeypatch.setattr(main_module, "_launch_real_edge_cdp", fake_cdp)
+    class FakeChromium:
+        def launch_persistent_context(self, **_kwargs):
+            raise AssertionError("专用 profile 不应走 Playwright 持久化抢锁")
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    assert main_module.create_context(FakePlaywright(), False) == "ctx"
+    assert launched["cdp"] is True
 
 
 def test_main_reports_launch_failure_code(monkeypatch, _stub_main_deps):
@@ -714,48 +1013,65 @@ def test_notify_skips_when_no_smtp_config(monkeypatch, tmp_path):
 
 
 def test_notify_skips_on_success(monkeypatch):
-    """成功不推送：避免每天无意义打扰"""
+    """成功和让位都不推送：避免每天无意义打扰。"""
     from utils import notify
+    from utils.outcomes import ExitCode, RunSnapshot
 
     called = {"n": 0}
-    monkeypatch.setattr(notify, "load_smtp_config", lambda *a, **k: called.__setitem__("n", called["n"] + 1))
+    monkeypatch.setattr(
+        notify,
+        "load_smtp_config",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1),
+    )
+    now = datetime(2026, 11, 8, 20, 0, 0)
 
-    assert notify.notify_failure(0, "log") is False
-    assert called["n"] == 0, "成功时不应去读 SMTP 配置，更不该发信"
+    for code in (ExitCode.SUCCESS, ExitCode.ALREADY_RUNNING):
+        snapshot = RunSnapshot(
+            pid=1,
+            log_path="log",
+            started_at=now,
+            finished_at=now,
+            exit_code=code,
+        )
+        assert notify.notify_failure(snapshot) is False
+    assert called["n"] == 0, "成功/让位时不应去读 SMTP 配置，更不该发信"
 
 
 def test_notify_sends_on_failure(monkeypatch):
     from utils import notify
+    from utils.outcomes import ExitCode, RunSnapshot
 
     sent = {}
     monkeypatch.setattr(
-        notify, "load_smtp_config",
-        lambda *a, **k: {"host": "h", "port": 465, "user": "u", "password": "p",
-                         "to": ["a@b.c"], "sender": "u", "use_ssl": True},
+        notify,
+        "load_smtp_config",
+        lambda *a, **k: {
+            "host": "h",
+            "port": 465,
+            "user": "u",
+            "password": "p",
+            "to": ["a@b.c"],
+            "sender": "u",
+            "use_ssl": True,
+        },
     )
-    monkeypatch.setattr(notify, "send_mail", lambda cfg, s, b, **k: sent.update(subject=s, body=b))
+    monkeypatch.setattr(
+        notify, "send_mail", lambda cfg, s, b, **k: sent.update(subject=s, body=b)
+    )
+    now = datetime(2026, 11, 8, 20, 0, 0)
+    snapshot = RunSnapshot(
+        pid=1,
+        log_path="log",
+        started_at=now,
+        finished_at=now,
+        exit_code=ExitCode.ALL_ACCOUNTS_FAILED,
+        log_text="账号全部失败",
+    )
 
-    assert notify.notify_failure(3, "账号全部失败") is True
+    assert notify.notify_failure(snapshot) is True
     assert "失败" in sent["subject"] and "BingPoints" in sent["subject"]
     assert "退出码：3" in sent["body"]
     assert "账号全部失败" in sent["body"]
-
-
-def test_notify_swallows_send_errors(monkeypatch):
-    """发送失败必须被吞掉并返回 False——通知失败不能把成功运行改成失败"""
-    from utils import notify
-
-    monkeypatch.setattr(
-        notify, "load_smtp_config",
-        lambda *a, **k: {"host": "h", "port": 465, "user": "u", "password": "p",
-                         "to": ["a@b.c"], "sender": "u", "use_ssl": True},
-    )
-
-    def boom(*a, **k):
-        raise smtplib.SMTPAuthenticationError(535, b"bad credentials")
-
-    monkeypatch.setattr(notify, "send_mail", boom)
-    assert notify.notify_failure(3, "log") is False
 
 
 def test_notify_swallows_config_errors(monkeypatch):
@@ -772,7 +1088,7 @@ def test_notify_subject_maps_exit_codes_to_reasons():
     """退出码要翻译成人话，否则收到邮件也不知道哪里坏了"""
     from utils import notify
 
-    for code in (2, 3, 4):
+    for code in range(8):
         subject = notify.build_subject(code)
         assert notify.EXIT_CODE_REASONS[code] in subject
 
@@ -842,6 +1158,16 @@ def test_build_body_tolerates_empty_log():
     assert "未取到日志内容" in body
 
 
+def test_failure_body_uses_current_edge_profile(monkeypatch, tmp_path):
+    from utils import notify
+
+    actual = tmp_path / "actual-edge-profile"
+    monkeypatch.setattr(notify, "EDGE_USER_DATA_DIR", actual)
+    body = notify.build_body(2, "")
+    assert str(actual) in body
+    assert "tmp_playwright_profile_edge" not in body
+
+
 def test_main_does_not_notify_on_success(monkeypatch, _stub_main_deps):
     """成功运行不应触发任何推送"""
     _fake_playwright(monkeypatch)
@@ -867,11 +1193,11 @@ def test_main_notifies_on_failure_and_keeps_exit_code(monkeypatch, _stub_main_de
 
     monkeypatch.setattr(
         notify_module, "notify_failure",
-        lambda code, log_text="", logger=print: seen.append(code) or True,
+        lambda snapshot, logger=print: seen.append(snapshot.exit_code) or True,
     )
 
     assert main_module.main() == 3
-    assert seen == [3], "失败必须按退出码推送一次"
+    assert seen == [ExitCode.ALL_ACCOUNTS_FAILED], "失败必须按退出码推送一次"
 
 
 def test_main_notify_exception_does_not_change_exit_code(monkeypatch, _stub_main_deps):
@@ -1045,24 +1371,135 @@ def test_create_context_passes_edge_executable_path(monkeypatch):
 
 
 def test_real_edge_profile_is_never_auto_killed(monkeypatch, tmp_path):
-    import main as main_module
     real = tmp_path / "real-edge-profile"
     real.mkdir()
     calls = []
     monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", real)
+    monkeypatch.setattr(main_module, "DEFAULT_EDGE_USER_DATA_DIR", real)
+    monkeypatch.setattr(main_module, "DEDICATED_EDGE_USER_DATA_DIR", tmp_path / "dedicated")
     monkeypatch.setattr(main_module.profile, "find_edge_executable", lambda: Path("D:/edge/msedge.exe"))
-    def fake_ensure(path, auto_kill=True):
-        calls.append(bool(auto_kill))
-        return False
-    monkeypatch.setattr(main_module.profile, "ensure_profile_available", fake_ensure)
+    cdp_calls = []
+    monkeypatch.setattr(
+        main_module,
+        "_launch_real_edge_cdp",
+        lambda *args, **kwargs: cdp_calls.append((args, kwargs)) or "ctx",
+    )
+    monkeypatch.setattr(
+        main_module.profile, "ensure_profile_available",
+        lambda path, auto_kill=True: calls.append(bool(auto_kill)) or False,
+    )
+    class FakePlaywright:
+        chromium = object()
+    with pytest.raises(SystemExit) as exc:
+        main_module.create_context(FakePlaywright(), False)
+    assert exc.value.code == 2
+    assert calls == [False]
+    assert cdp_calls == []
+
+
+def test_external_profile_is_never_auto_killed(monkeypatch, tmp_path):
+    external = tmp_path / "custom-edge-profile"
+    external.mkdir()
+    calls = []
+    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", external)
+    monkeypatch.setattr(main_module, "DEFAULT_EDGE_USER_DATA_DIR", tmp_path / "real")
+    monkeypatch.setattr(main_module, "DEDICATED_EDGE_USER_DATA_DIR", tmp_path / "dedicated")
+    monkeypatch.setattr(main_module.profile, "find_edge_executable", lambda: Path("D:/edge/msedge.exe"))
+    monkeypatch.setattr(
+        main_module.profile, "ensure_profile_available",
+        lambda path, auto_kill=True: calls.append(bool(auto_kill)) or True,
+    )
+    cdp_calls = []
+    monkeypatch.setattr(
+        main_module,
+        "_launch_real_edge_cdp",
+        lambda *args, **kwargs: cdp_calls.append((args, kwargs)) or "ctx",
+    )
+    class FakePlaywright:
+        chromium = object()
+    assert main_module.create_context(FakePlaywright(), False) == "ctx"
+    assert calls == [False]
+    assert cdp_calls
+
+
+def test_dedicated_profile_can_be_auto_killed(monkeypatch, tmp_path):
+    import json
+
+    dedicated = tmp_path / "tmp_playwright_profile_edge"
+    (dedicated / "Default").mkdir(parents=True)
+    (dedicated / "Default" / "Preferences").write_text("{}", encoding="utf-8")
+    (dedicated / "Local State").write_text(
+        json.dumps({
+            "profile": {
+                "info_cache": {
+                    "Default": {"user_name": "synthetic@example.invalid"}
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    calls = []
+    monkeypatch.delenv("BING_REWARDS_NO_PROFILE_KILL", raising=False)
+    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", dedicated)
+    monkeypatch.setattr(main_module, "DEDICATED_EDGE_USER_DATA_DIR", dedicated)
+    monkeypatch.setattr(main_module, "DEFAULT_EDGE_USER_DATA_DIR", tmp_path / "real")
+    monkeypatch.setattr(main_module.profile, "find_edge_executable", lambda: Path("D:/edge/msedge.exe"))
+    monkeypatch.setattr(
+        main_module.profile, "ensure_profile_available",
+        lambda path, auto_kill=True: calls.append(bool(auto_kill)) or True,
+    )
+    monkeypatch.setattr(
+        main_module, "_launch_real_edge_cdp", lambda *args, **kwargs: "ctx"
+    )
+    class FakePlaywright:
+        chromium = object()
+    assert main_module.create_context(FakePlaywright(), False) == "ctx"
+    assert calls == [True]
+
+
+def test_legacy_user_data_dir_conflict_can_be_auto_killed(monkeypatch, tmp_path):
+    monkeypatch.delenv("BING_REWARDS_NO_PROFILE_KILL", raising=False)
+    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", main_module.USER_DATA_DIR)
+    monkeypatch.setattr(main_module, "DEDICATED_EDGE_USER_DATA_DIR", tmp_path / "dedicated")
+    monkeypatch.setattr(main_module, "DEFAULT_EDGE_USER_DATA_DIR", tmp_path / "real")
+    monkeypatch.setattr(main_module.profile, "find_edge_executable", lambda: Path("D:/edge/msedge.exe"))
+    calls = []
+    monkeypatch.setattr(
+        main_module.profile, "ensure_profile_available",
+        lambda path, auto_kill=True: calls.append(bool(auto_kill)) or False,
+    )
+
     class FakeChromium:
         def launch_persistent_context(self, **kwargs):
-            raise AssertionError("must not launch while real profile is busy")
+            raise AssertionError("占用未解除时不应继续启动")
+
     class FakePlaywright:
         chromium = FakeChromium()
+
+    with pytest.raises(SystemExit) as exc:
+        main_module.create_context(FakePlaywright(), False)
+    assert exc.value.code == 2
+    assert calls == [True]
+
+
+def test_external_profile_busy_help_does_not_suggest_kill(monkeypatch, tmp_path, capsys):
+    external = tmp_path / "custom-profile"
+    monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", external)
+    monkeypatch.setattr(main_module, "DEFAULT_EDGE_USER_DATA_DIR", tmp_path / "real")
+    monkeypatch.setattr(main_module, "DEDICATED_EDGE_USER_DATA_DIR", tmp_path / "dedicated")
+    monkeypatch.setattr(main_module.profile, "find_edge_executable", lambda: Path("D:/edge/msedge.exe"))
+    monkeypatch.setattr(
+        main_module.profile, "ensure_profile_available", lambda *a, **k: False
+    )
+
+    class FakePlaywright:
+        chromium = object()
+
     with pytest.raises(SystemExit):
         main_module.create_context(FakePlaywright(), False)
-    assert calls == [False]
+    output = capsys.readouterr().out
+    assert "外部 Edge profile" in output
+    assert "--kill" not in output
 
 
 def test_launch_persistent_rejects_non_edge():
@@ -1100,14 +1537,54 @@ def test_create_context_rejects_profile_subdirectory(monkeypatch, tmp_path):
         main_module.create_context(FakePlaywright(), False)
 
 
+def test_launch_visible_edge_for_login_popen_arguments(monkeypatch, tmp_path):
+    import ctypes
+
+    user_data = tmp_path / "dedicated"
+    launched = {}
+
+    monkeypatch.setattr(
+        main_module.profile, "find_edge_executable", lambda: Path("D:/edge/msedge.exe")
+    )
+    monkeypatch.setattr(
+        ctypes.windll.kernel32,
+        "GetShortPathNameW",
+        lambda path, buf, size: (setattr(buf, "value", str(path)), 1)[1],
+    )
+
+    class Process:
+        def terminate(self):
+            pytest.fail("首次登录不应立即结束 Edge")
+
+        def kill(self):
+            pytest.fail("首次登录不应立即结束 Edge")
+
+    def fake_popen(args, **kwargs):
+        launched.update(args=args, kwargs=kwargs)
+        return Process()
+
+    monkeypatch.setattr(main_module.subprocess, "Popen", fake_popen)
+    main_module._launch_visible_edge_for_login(user_data)
+
+    assert "--headless=new" not in launched["args"]
+    assert not any(arg.startswith("--remote-debugging-port=") for arg in launched["args"])
+    assert any(
+        arg == f"--user-data-dir={user_data}" for arg in launched["args"]
+    )
+    assert main_module.BING_HOME in launched["args"]
+    assert launched["kwargs"]["stdin"] is main_module.subprocess.DEVNULL
+
+
 def test_real_edge_profile_uses_cdp_bridge(monkeypatch, tmp_path):
-    """正式 profile 必须走正常 Edge 启动 + CDP，不得再用 Playwright 抢 profile。"""
+    """可持久化 profile 必须走正常 Edge 启动 + CDP，避免 Playwright 抢锁。"""
     import ctypes
 
     real = tmp_path / "User Data"
     real.mkdir()
     launched = {}
     monkeypatch.setattr(main_module, "EDGE_USER_DATA_DIR", real)
+    monkeypatch.setattr(main_module, "DEFAULT_EDGE_USER_DATA_DIR", real)
+    monkeypatch.setattr(main_module, "DEDICATED_EDGE_USER_DATA_DIR", tmp_path / "dedicated")
     monkeypatch.setattr(main_module.profile, "find_edge_executable", lambda: Path("D:/edge/msedge.exe"))
     monkeypatch.setattr(main_module.profile, "ensure_profile_available", lambda *a, **k: True)
     monkeypatch.setattr(main_module, "_free_loopback_port", lambda: 9333)

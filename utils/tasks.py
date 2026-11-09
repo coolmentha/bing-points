@@ -51,6 +51,9 @@ RISK_CONTROL_PATHS = (
     "/challenge", "/captcha", "/auth/challenge", "/login/challenge",
 )
 
+# 编程错误必须冒泡，避免 NameError 被误当成普通页面/驱动失败。
+_CODE_ERRORS = (NameError, AttributeError, TypeError, AssertionError)
+
 
 class RewardsRiskControlError(RuntimeError):
     """页面出现微软验证码或限制页时立即停止当前账号。"""
@@ -963,6 +966,17 @@ def _open_task_card(page, title: str):
         return None
 
 
+def _is_app_only_page(page) -> bool:
+    """页面仅限积分商城应用完成时返回 True；驱动读取失败时保守返回 False。"""
+    try:
+        content = page.content() or ""
+    except _CODE_ERRORS:
+        raise
+    except Exception:
+        return False
+    return "积分商城" in content or ("仅限" in content and "应用" in content)
+
+
 def do_daily_offer_tasks(page) -> int:
     """完成 /earn 日常搜索与每日拼图。"""
     print("  打开积分赚取页...")
@@ -1005,9 +1019,10 @@ def do_daily_offer_tasks(page) -> int:
             if ok:
                 completed += 1
                 print("    完成")
-        except (RewardsRiskControlError, RiskDetectionError):
+        except (RewardsRiskControlError, RiskDetectionError, *_CODE_ERRORS):
             raise
         except Exception as exc:
+            # Playwright/页面操作异常仍是单项失败；编程错误已在上方显式冒泡。
             print(f"    失败: {str(exc).splitlines()[0][:100]}")
         random_sleep(short_range=(1, 3))
 

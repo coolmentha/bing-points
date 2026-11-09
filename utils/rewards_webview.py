@@ -304,22 +304,25 @@ def run_rewards_desktop_task(expected_email: str | None = None) -> int:
     if result.get("protocol_error"):
         print("  WebView 结果协议校验失败，账号不报告成功")
         return REWARDS_DESKTOP_ERROR
-    if result.get("uia_unavailable"):
-        print("  Rewards 桌面应用 UIA 不可用")
-        return REWARDS_DESKTOP_UIA_UNAVAILABLE
-    if not result.get("available") or not result.get("uia_ready"):
-        print("  WebView 未返回可验证的 UIA 状态，账号不报告成功")
-        return REWARDS_DESKTOP_ERROR
-
+    task_state = result.get("task_state")
     identity_state = result.get("identity_state")
-    if identity_state == "identity_unverified":
-        print("  无法读取 Rewards 桌面应用当前账号，未执行任务")
-        return REWARDS_DESKTOP_IDENTITY_UNVERIFIED
     if identity_state == "identity_mismatch":
         print("  Rewards 桌面应用当前账号与目标不一致，未执行任务")
         return REWARDS_DESKTOP_IDENTITY_MISMATCH
+    if not result.get("uia_ready"):
+        if result.get("uia_unavailable") or task_state == "uia_unavailable":
+            print("  Rewards 桌面应用 UIA 不可用")
+            return REWARDS_DESKTOP_UIA_UNAVAILABLE
+        print("  WebView 未返回可验证的 UIA 状态，账号不报告成功")
+        return REWARDS_DESKTOP_ERROR
+    if not result.get("available"):
+        print("  WebView 未返回可验证的 UIA 状态，账号不报告成功")
+        return REWARDS_DESKTOP_ERROR
 
-    task_state = result.get("task_state")
+    if identity_state == "identity_unverified":
+        print("  无法读取 Rewards 桌面应用当前账号，未执行任务")
+        return REWARDS_DESKTOP_IDENTITY_UNVERIFIED
+
     if task_state == "task_item_missing":
         print("  已确认 WebView 每周任务页，但找不到可执行任务项，账号不报告成功")
         return REWARDS_DESKTOP_TASK_ITEM_MISSING

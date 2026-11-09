@@ -74,7 +74,7 @@ set "BING_REWARDS_LOG_FILE=%LOG_FILE%"
 "%PYTHON_EXE%" -u -X utf8 main.py %* >> "%LOG_FILE%" 2>&1
 set "exit_code=%errorlevel%"
 
-echo [%ISO%] ===== BingPoints run end exit=%exit_code% ===== >> "%LOG_FILE%"
+echo [%ISO%] ===== BingPoints launcher end exit=%exit_code% ===== >> "%LOG_FILE%"
 
 if not "%exit_code%"=="0" (
     echo.

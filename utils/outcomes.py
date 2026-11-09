@@ -1,8 +1,4 @@
-"""运行结果的领域模型。
-
-阶段 0 只定义纯数据结构与聚合规则，不连接浏览器、UIA、通知或主流程。
-现有生产行为保持不变；后续迁移时由流水线逐步改用这些类型。
-"""
+"""运行结果的领域模型。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -46,6 +42,27 @@ class ExitCode(int, Enum):
     RISK_CONTROL = 5
     PARTIAL_FAILURE = 6
     ALREADY_RUNNING = 7
+
+
+_EXIT_CODE_REASONS = {
+    ExitCode.SUCCESS: "运行成功",
+    ExitCode.INTERNAL_ERROR: "内部错误（未预期异常）",
+    ExitCode.STARTUP_FAILED: "启动失败（浏览器 profile 被占用 / 临时目录不可写 / 会话0拿不到窗口站）",
+    ExitCode.ALL_ACCOUNTS_FAILED: "全部账号处理失败（通常是登录态失效或网络问题）",
+    ExitCode.ACCOUNT_CONFIG_FAILED: "读取账号配置失败（accounts.txt 缺失或格式错误）",
+    ExitCode.RISK_CONTROL: "检测到微软验证页面或验证码，已停止运行",
+    ExitCode.PARTIAL_FAILURE: "部分账号处理失败（至少一个账号成功、至少一个失败）",
+    ExitCode.ALREADY_RUNNING: "已有另一个实例在运行，本次已安全让位",
+}
+
+
+def exit_code_reason(code: int | ExitCode) -> str:
+    """返回稳定的中文退出码说明，供日志和通知共用。"""
+    try:
+        normalized = ExitCode(int(code))
+    except (TypeError, ValueError):
+        return f"未知错误（退出码 {code}）"
+    return _EXIT_CODE_REASONS[normalized]
 
 
 @dataclass(frozen=True)
@@ -150,3 +167,15 @@ def task_result(
         before=before,
         after=after,
     )
+
+
+@dataclass(frozen=True)
+class RunSnapshot:
+    """一次运行完成后的不可变通知快照。"""
+
+    pid: int | None
+    log_path: str
+    started_at: datetime
+    finished_at: datetime
+    exit_code: ExitCode
+    log_text: str = ""

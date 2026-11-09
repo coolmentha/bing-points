@@ -15,15 +15,13 @@ from email.mime.text import MIMEText
 from email.utils import formataddr
 from pathlib import Path
 
-from utils.config import ENV_PATH
+from utils.config import EDGE_USER_DATA_DIR, ENV_PATH
+from utils.outcomes import ExitCode, RunSnapshot, exit_code_reason
 
-# main.py 返回的退出码 → 人类可读的失败原因
+# 兼容旧调用方：原因文案唯一来源是 ExitCode 映射。
 EXIT_CODE_REASONS = {
-    2: "启动失败（浏览器 profile 被占用 / 临时目录不可写 / 会话0拿不到窗口站）",
-    3: "全部账号处理失败（通常是登录态失效或网络问题）",
-    4: "读取账号配置失败（accounts.txt 缺失或格式错误）",
-    5: "检测到微软验证页面或验证码，已停止运行",
-    6: "部分账号处理失败（至少一个账号成功、至少一个失败）",
+    int(code): exit_code_reason(code)
+    for code in ExitCode
 }
 
 # 环境变量名，集中在这里便于文档与测试引用
@@ -40,13 +38,9 @@ ENV_KEYS = (
 
 def _load_env() -> None:
     """把项目根目录的 .env 读进环境变量（缺失或没装 dotenv 都跳过）"""
-    try:
-        from dotenv import load_dotenv
+    from utils.config import load_env
 
-        load_dotenv(ENV_PATH, override=False)
-    except Exception:
-        # 没装 python-dotenv 时退化为只读真实环境变量
-        pass
+    load_env()
 
 
 def load_smtp_config(env: dict | None = None) -> dict | None:
@@ -75,7 +69,8 @@ def load_smtp_config(env: dict | None = None) -> dict | None:
 
 
 def build_subject(exit_code: int, account_summary: str = "") -> str:
-    reason = EXIT_CODE_REASONS.get(exit_code, "未知错误")
+    """生成失败邮件主题；退出码原因与运行主流程共用同一映射。"""
+    reason = exit_code_reason(exit_code)
     subject = f"[BingPoints] 运行失败 - {reason}"
     if account_summary:
         subject += f"（{account_summary}）"
@@ -84,43 +79,62 @@ def build_subject(exit_code: int, account_summary: str = "") -> str:
 
 @dataclass(frozen=True)
 class RunLog:
-    """一次运行的通知快照，避免发送时误读后来实例的日志。"""
+    """旧版通知文本容器，保留给外部调用方兼容使用。"""
 
     text: str = ""
-    run_info: dict | None = None
 
 
-def _coerce_run_log(log: str | RunLog | None) -> RunLog:
-    if isinstance(log, RunLog):
-        return log
-    return RunLog(str(log or ""))
+def _snapshot_log_text(snapshot: RunSnapshot | None, fallback: str = "") -> str:
+    if snapshot is None:
+        return fallback
+    return snapshot.log_text or fallback
 
 
 def build_body(
-    exit_code: int, log_text: str | RunLog = "", tail_lines: int = 40
+    snapshot_or_exit_code: RunSnapshot | int,
+    log_text: str | RunLog | None = None,
+    tail_lines: int = 40,
 ) -> str:
-    """正文：本次运行身份 + 结论 + 日志尾部。"""
-    run_log = _coerce_run_log(log_text)
-    info = run_log.run_info or {}
-    reason = EXIT_CODE_REASONS.get(exit_code, "未知错误")
-    pid = info.get("pid", "未知")
-    log_path = info.get("log_path", "未知")
-    started_at = info.get("started_at", "未知")
-    log_mtime = info.get("log_mtime", "未知")
+    """正文：不可变运行身份 + 统一退出码原因 + 日志尾部。
+
+    build_body(exit_code, text) 继续兼容旧调用；生产通知使用
+    build_body(snapshot)，不再读取共享的可变 run_info。
+    """
+    if isinstance(snapshot_or_exit_code, RunSnapshot):
+        snapshot = snapshot_or_exit_code
+        exit_code = int(snapshot.exit_code)
+        fallback = log_text.text if isinstance(log_text, RunLog) else str(log_text or "")
+        text = _snapshot_log_text(snapshot, fallback)
+        pid = snapshot.pid if snapshot.pid is not None else "未知"
+        log_path = snapshot.log_path or "未知"
+        started_at = snapshot.started_at.strftime("%Y-%m-%d %H:%M:%S")
+        finished_at = snapshot.finished_at.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        exit_code = int(snapshot_or_exit_code)
+        if isinstance(log_text, RunLog):
+            text = log_text.text
+        else:
+            text = str(log_text or "")
+        pid = "未知"
+        log_path = "未知"
+        started_at = "未知"
+        finished_at = "未知"
+
+    reason = exit_code_reason(exit_code)
     lines = [
         "BingPoints 无人值守运行失败。",
         "",
         f"本次运行 PID：{pid}",
         f"本次运行日志：{log_path}",
         f"运行开始时间：{started_at}",
-        f"日志最后修改时间：{log_mtime}",
+        f"运行结束时间：{finished_at}",
         "",
         f"退出码：{exit_code}",
         f"原因：{reason}",
         "",
         "---- 日志尾部 ----",
     ]
-    tail = [ln for ln in run_log.text.strip().splitlines() if ln.strip()]
+    tail = [ln for ln in text.strip().splitlines() if ln.strip()]
     if tail:
         lines.extend(tail[-tail_lines:])
     else:
@@ -130,7 +144,7 @@ def build_body(
         "---- 排查建议 ----",
         f"- 完整日志：{log_path}",
         "- 看日志里的“会话号”：0=服务会话(无窗口站)，非0=用户桌面会话",
-        "- 登录失败多为登录态失效：检查 tmp_playwright_profile 是否被删除",
+        f"- 登录失败多为登录态失效：检查当前 Edge profile {EDGE_USER_DATA_DIR} 并完成过首次登录",
     ]
     return "\n".join(lines)
 
@@ -177,15 +191,18 @@ def read_log_tail(log_path=None, tail_lines: int = 40) -> str:
 
 
 def notify_failure(
-    exit_code: int, log_text: str | RunLog = "", logger=print
+    snapshot: RunSnapshot | int,
+    log_text: str | RunLog | None = None,
+    logger=print,
 ) -> bool:
     """失败时推送通知。
 
     返回是否真的发出了邮件。任何异常都只记日志、返回 False，
     绝不向上抛——通知失败不能连带把运行结果改坏。
     """
-    if exit_code == 0:
-        return False  # 只推失败
+    exit_code = int(snapshot.exit_code) if isinstance(snapshot, RunSnapshot) else int(snapshot)
+    if exit_code in (ExitCode.SUCCESS, ExitCode.ALREADY_RUNNING):
+        return False  # 成功和正常让位都不打扰
 
     try:
         cfg = load_smtp_config()
@@ -198,7 +215,7 @@ def notify_failure(
         return False
 
     subject = build_subject(exit_code)
-    body = build_body(exit_code, log_text)
+    body = build_body(snapshot, log_text)
     try:
         send_mail(cfg, subject, body)
     except Exception as exc:

@@ -1,7 +1,9 @@
 """单账号流水线的 AccountOutcome 契约测试。"""
+from pathlib import Path
+
 import pytest
 
-from utils import account_pipeline, browser, clients, config, tasks
+from utils import account_pipeline, browser, clients, config, rewards_webview, tasks
 from utils.edge_streak import EdgeStreakResult, EdgeStreakStatus
 from utils.outcomes import AccountOutcome, TaskOutcome, TaskStatus
 
@@ -205,16 +207,70 @@ def test_run_account_outcome_daily_activities_failure_is_failed(monkeypatch):
     assert _task_by_name(outcome, "pc_search").status is TaskStatus.SUCCESS
 
 
-def test_run_account_outcome_pc_search_failure_is_failed(monkeypatch):
+def test_run_account_outcome_pc_search_score_stalled_fails(monkeypatch):
     _install_successful_account(monkeypatch)
-    monkeypatch.setattr(account_pipeline, "DEFAULT_PC_SEARCHES", 3)
+    monkeypatch.setattr(account_pipeline, "DEFAULT_PC_SEARCHES", 20)
     monkeypatch.setattr(
         account_pipeline,
         "do_searches",
         lambda *_a, **_k: browser.SearchOutcome(
             status=browser.SearchStatus.SCORE_STALLED,
-            requested=3,
-            completed=1,
+            requested=20,
+            completed=8,
+        ),
+    )
+
+    outcome = account_pipeline._run_account_outcome(
+        None, _Context(), "user@example.invalid", "pw", True
+    )
+
+    pc_search = _task_by_name(outcome, "pc_search")
+    assert outcome.success is False
+    assert pc_search.status is TaskStatus.FAILED
+    assert pc_search.required is True
+    assert (
+        pc_search.detail
+        == "积分连续无增长，无法确认搜索是否已封顶，按未完成处理"
+    )
+
+
+@pytest.mark.parametrize(
+    "search_status",
+    [browser.SearchStatus.NO_KEYWORDS, browser.SearchStatus.INTERRUPTED],
+)
+def test_run_account_outcome_pc_search_other_incomplete_states_fail(
+    monkeypatch, search_status
+):
+    _install_successful_account(monkeypatch)
+    monkeypatch.setattr(account_pipeline, "DEFAULT_PC_SEARCHES", 20)
+    monkeypatch.setattr(
+        account_pipeline,
+        "do_searches",
+        lambda *_a, **_k: browser.SearchOutcome(
+            status=search_status,
+            requested=20,
+            completed=8,
+        ),
+    )
+
+    outcome = account_pipeline._run_account_outcome(
+        None, _Context(), "user@example.invalid", "pw", True
+    )
+
+    assert outcome.success is False
+    assert _task_by_name(outcome, "pc_search").status is TaskStatus.FAILED
+
+
+def test_run_account_outcome_pc_search_completed_short_of_target_fails(monkeypatch):
+    _install_successful_account(monkeypatch)
+    monkeypatch.setattr(account_pipeline, "DEFAULT_PC_SEARCHES", 20)
+    monkeypatch.setattr(
+        account_pipeline,
+        "do_searches",
+        lambda *_a, **_k: browser.SearchOutcome(
+            status=browser.SearchStatus.COMPLETED,
+            requested=20,
+            completed=8,
         ),
     )
 
@@ -317,6 +373,43 @@ def test_run_account_outcome_webview_uia_unavailable_is_optional_skip(monkeypatc
     assert webview.status is TaskStatus.ENVIRONMENT_UNAVAILABLE
     assert webview.required is False
     assert outcome.success is True
+
+
+def test_run_account_outcome_real_uia_unavailable_output_is_optional_skip(
+    monkeypatch,
+):
+    _install_successful_account(monkeypatch)
+    def fake_run(args, **_kwargs):
+        result_path = Path(args[args.index("-ResultPath") + 1])
+        run_id = args[args.index("-RunId") + 1]
+        result_path.write_text(
+            f"RUN_ID={run_id}\n"
+            "AVAILABLE=1\n"
+            "UIA_READY=0\n"
+            "TASK_STATE=uia_unavailable\n"
+            "ERROR=RootWebArea not found\n"
+            "IDENTITY_STATE=identity_unverified\n",
+            encoding="utf-8",
+        )
+        return type("Result", (), {"returncode": 0, "stdout": ""})()
+
+    monkeypatch.setattr(
+        rewards_webview, "_rewards_desktop_hwnd", lambda: 123
+    )
+    monkeypatch.setattr(rewards_webview.subprocess, "run", fake_run)
+    monkeypatch.setattr(rewards_webview, "ENABLE_REWARDS_DESKTOP", True)
+    monkeypatch.setattr(
+        account_pipeline, "run_rewards_desktop_task", rewards_webview.run_rewards_desktop_task
+    )
+
+    outcome = account_pipeline._run_account_outcome(
+        None, _Context(), "user@example.invalid", "pw", True
+    )
+
+    webview = _task_by_name(outcome, "webview")
+    assert outcome.success is True
+    assert webview.status is TaskStatus.ENVIRONMENT_UNAVAILABLE
+    assert webview.required is False
 
 
 @pytest.mark.parametrize(
